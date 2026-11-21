@@ -3,6 +3,7 @@ import Foundation
 struct CompilationResult: Sendable {
     let pdfData: Data
     let log: String
+    let diagnostics: [BuildDiagnostic]
     let syncTeX: SyncTeXMap?
     let artifactDirectory: URL?
     let artifactWarning: String?
@@ -11,8 +12,8 @@ struct CompilationResult: Sendable {
 enum TectonicError: LocalizedError {
     case engineNotFound
     case invalidEngine(URL)
-    case failed(status: Int32, log: String)
-    case missingPDF(log: String)
+    case failed(status: Int32, log: String, diagnostics: [BuildDiagnostic])
+    case missingPDF(log: String, diagnostics: [BuildDiagnostic])
 
     var errorDescription: String? {
         switch self {
@@ -20,7 +21,7 @@ enum TectonicError: LocalizedError {
             "Tectonic was not found. Install it with brew install tectonic or choose its executable from the Build menu."
         case let .invalidEngine(url):
             "Could not run the selected Tectonic executable at \(url.path)."
-        case let .failed(status, _):
+        case let .failed(status, _, _):
             "Tectonic failed with exit code \(status)."
         case .missingPDF:
             "Tectonic finished without generating a PDF. Check that the document contains typeset material."
@@ -29,8 +30,15 @@ enum TectonicError: LocalizedError {
 
     var log: String? {
         switch self {
-        case let .failed(_, log), let .missingPDF(log): log
+        case let .failed(_, log, _), let .missingPDF(log, _): log
         default: nil
+        }
+    }
+
+    var diagnostics: [BuildDiagnostic] {
+        switch self {
+        case let .failed(_, _, diagnostics), let .missingPDF(_, diagnostics): diagnostics
+        default: []
         }
     }
 }
@@ -150,6 +158,12 @@ struct TectonicCompiler {
         let engineLog = String(decoding: try Data(contentsOf: logURL), as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         var log = overlay?.originalPaths(in: engineLog, stagedAt: stagedProject) ?? engineLog
+        let transcript = readLog("texput.log", from: resultDirectory)
+        let bibliographyLog = readLog("texput.blg", from: resultDirectory)
+        var diagnostics = TectonicDiagnostics(target: fileURL, projectRoot: projectRoot).parse(
+            output: log, transcript: overlay?.originalPaths(in: transcript, stagedAt: stagedProject) ?? transcript,
+            bibliographyLog: bibliographyLog
+        )
         let artifactDirectory: URL?
         let artifactWarning: String?
         do {
@@ -161,17 +175,18 @@ struct TectonicCompiler {
             artifactDirectory = nil
             artifactWarning = "Could not save build files in the project. \(error.localizedDescription)"
         }
+        if let artifactWarning { diagnostics.append(BuildDiagnostic(severity: .warning, message: artifactWarning)) }
         if let artifactDirectory {
             log = log.replacingOccurrences(of: resultDirectory.resolvingSymlinksInPath().path, with: artifactDirectory.path)
                 .replacingOccurrences(of: resultDirectory.path, with: artifactDirectory.path)
         }
         let failureLog = [log, artifactWarning ?? ""].filter { !$0.isEmpty }.joined(separator: "\n\n")
         guard process.terminationStatus == 0 else {
-            throw TectonicError.failed(status: process.terminationStatus, log: failureLog)
+            throw TectonicError.failed(status: process.terminationStatus, log: failureLog, diagnostics: diagnostics)
         }
         let pdfURL = resultDirectory.appendingPathComponent("texput.pdf")
         guard let pdf = try? Data(contentsOf: pdfURL), pdf.starts(with: "%PDF-".utf8) else {
-            throw TectonicError.missingPDF(log: failureLog)
+            throw TectonicError.missingPDF(log: failureLog, diagnostics: diagnostics)
         }
         let syncTeX = ["texput.synctex.gz", "texput.synctex"].lazy
             .compactMap { try? Data(contentsOf: resultDirectory.appendingPathComponent($0), options: .mappedIfSafe) }
@@ -180,8 +195,16 @@ struct TectonicCompiler {
                            stagedProjectRoot: overlay == nil ? nil : stagedProject,
                            originalProjectRoot: overlay?.root ?? projectRoot)
             }
-        return CompilationResult(pdfData: pdf, log: log, syncTeX: syncTeX,
+        return CompilationResult(pdfData: pdf, log: log, diagnostics: diagnostics, syncTeX: syncTeX,
                                  artifactDirectory: artifactDirectory, artifactWarning: artifactWarning)
+    }
+
+    private static func readLog(_ name: String, from directory: URL) -> String {
+        let url = directory.appendingPathComponent(name)
+        guard let reader = try? FileHandle(forReadingFrom: url) else { return "" }
+        defer { try? reader.close() }
+        let data = (try? reader.read(upToCount: 8 * 1024 * 1024)) ?? Data()
+        return String(decoding: data, as: UTF8.self)
     }
 }
 

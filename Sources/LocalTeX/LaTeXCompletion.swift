@@ -1,7 +1,7 @@
 import AppKit
 
 enum LaTeXCompletion {
-    struct Candidate {
+    struct Candidate: Sendable {
         let insertion: String
         let label: String
         let detail: String
@@ -12,10 +12,64 @@ enum LaTeXCompletion {
         let candidates: [Candidate]
     }
 
+    struct ReferenceMatch {
+        let kind: ProjectReferenceKind
+        let query: String
+        let range: NSRange
+    }
+
+    private static let citationCommands: Set = ["cite", "citep", "citet", "citealt", "citealp", "citeauthor", "citeyear",
+                                                 "citeyearpar", "parencite", "textcite", "autocite", "footcite", "nocite",
+                                                 "smartcite", "supercite", "fullcite", "notecite"]
+    private static let referenceCommands: Set = ["ref", "pageref", "eqref", "autoref", "cref", "cpageref", "nameref",
+                                                  "vref", "vpageref"]
+    private static let referenceArgument = try! NSRegularExpression(
+        pattern: #"\\([A-Za-z]+)\*?\s*(?:\[[^\]\r\n]*\]\s*){0,2}\{([^{}]*)\z"#
+    )
+
+    static func referenceMatch(in source: NSString, at caret: Int) -> ReferenceMatch? {
+        guard caret > 0, caret <= source.length else { return nil }
+        let lowerBound = max(0, caret - 2_048)
+        let searchRange = NSRange(location: lowerBound, length: caret - lowerBound)
+        guard let match = referenceArgument.firstMatch(in: source as String, range: searchRange),
+              isCode(in: source, before: match.range.location), isCode(in: source, before: caret) else { return nil }
+        let command = source.substring(with: match.range(at: 1)).lowercased()
+        let kind: ProjectReferenceKind
+        if citationCommands.contains(command) { kind = .citation }
+        else if referenceCommands.contains(command) { kind = .label }
+        else { return nil }
+
+        let argument = match.range(at: 2)
+        let comma = source.range(of: ",", options: .backwards, range: argument)
+        var start = comma.location == NSNotFound ? argument.location : NSMaxRange(comma)
+        while start < caret, isReferenceWhitespace(source.character(at: start)) { start += 1 }
+        let query = source.substring(with: NSRange(location: start, length: caret - start))
+        guard query.rangeOfCharacter(from: invalidReferenceCharacters) == nil else { return nil }
+
+        // Replace the rest of an existing key when completing from the middle of it.
+        var end = caret
+        while end < min(source.length, caret + 512), !isReferenceSeparator(source.character(at: end)) { end += 1 }
+        return ReferenceMatch(kind: kind, query: query, range: NSRange(location: start, length: end - start))
+    }
+
+    private static let invalidReferenceCharacters = CharacterSet(charactersIn: "\\%#")
+
+    private static func isReferenceWhitespace(_ character: UInt16) -> Bool {
+        character == 0x20 || (0x09...0x0D).contains(character)
+    }
+
+    private static func isReferenceSeparator(_ character: UInt16) -> Bool {
+        if isReferenceWhitespace(character) { return true }
+        switch character {
+        case 0x25, 0x2C, 0x5C, 0x7B, 0x7D: return true
+        default: return false
+        }
+    }
+
     private static let commandNames = """
         documentclass usepackage begin end section subsection subsubsection chapter paragraph subparagraph \
-        title author date maketitle tableofcontents label ref pageref eqref autoref cref cite citep citet \
-        textcite parencite bibliography bibliographystyle addbibresource printbibliography \
+        title author date maketitle tableofcontents label ref pageref eqref autoref cref Cref nameref cite citep citet \
+        textcite parencite autocite footcite citeauthor citeyear bibliography bibliographystyle addbibresource printbibliography \
         textbf textit texttt textsc textsf textsl textrm textup textnormal emph underline footnote footnotemark \
         item caption captionof centering includegraphics graphicspath input include includeonly \
         frac dfrac tfrac sqrt overline underline widehat widetilde operatorname mathbf mathrm mathcal mathbb \
@@ -141,6 +195,7 @@ final class LaTeXCompletionPopup: NSObject, NSTableViewDataSource, NSTableViewDe
                                              backing: .buffered, defer: false)
     private let table = NSTableView()
     private var candidates: [LaTeXCompletion.Candidate] = []
+    private var showsReferenceDetails = false
 
     var onAccept: ((LaTeXCompletion.Candidate) -> Void)?
     var isVisible: Bool { panel.isVisible }
@@ -188,13 +243,16 @@ final class LaTeXCompletionPopup: NSObject, NSTableViewDataSource, NSTableViewDe
         ])
     }
 
-    func show(_ candidates: [LaTeXCompletion.Candidate], below caret: NSRect, in parent: NSWindow) {
+    func show(_ candidates: [LaTeXCompletion.Candidate], below caret: NSRect, in parent: NSWindow,
+              showsReferenceDetails: Bool = false) {
         guard let screen = parent.screen ?? NSScreen.main else { return }
         self.candidates = candidates
+        self.showsReferenceDetails = showsReferenceDetails
+        table.rowHeight = showsReferenceDetails ? 35 : 22
         table.reloadData()
         select(row: 0)
         let visible = screen.visibleFrame
-        let width: CGFloat = 218
+        let width: CGFloat = min(showsReferenceDetails ? 404 : 218, visible.width - 4)
         let height = CGFloat(min(candidates.count, 8)) * table.rowHeight + 8
         let x = min(max(caret.minX, visible.minX + 2), visible.maxX - width - 2)
         let below = caret.minY - height - 3
@@ -249,21 +307,32 @@ final class LaTeXCompletionPopup: NSObject, NSTableViewDataSource, NSTableViewDe
         let label = NSTextField(labelWithString: option.label)
         label.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
         label.textColor = AppPalette.text
+        label.lineBreakMode = .byTruncatingTail
         let detail = NSTextField(labelWithString: option.detail)
-        detail.font = .systemFont(ofSize: 13)
-        detail.textColor = AppPalette.text
+        detail.font = .systemFont(ofSize: showsReferenceDetails ? 11 : 13)
+        detail.textColor = showsReferenceDetails ? AppPalette.secondaryText : AppPalette.text
+        detail.lineBreakMode = .byTruncatingTail
         let cell = NSView()
         for view in [label, detail] {
             view.translatesAutoresizingMaskIntoConstraints = false
             cell.addSubview(view)
         }
-        NSLayoutConstraint.activate([
-            label.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 9),
-            label.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-            detail.leadingAnchor.constraint(greaterThanOrEqualTo: label.trailingAnchor, constant: 5),
-            detail.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -9),
-            detail.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
-        ])
+        NSLayoutConstraint.activate([label.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 9),
+                                     detail.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -9)])
+        if showsReferenceDetails {
+            NSLayoutConstraint.activate([
+                label.topAnchor.constraint(equalTo: cell.topAnchor, constant: 3),
+                label.trailingAnchor.constraint(equalTo: detail.trailingAnchor),
+                detail.leadingAnchor.constraint(equalTo: label.leadingAnchor),
+                detail.topAnchor.constraint(equalTo: label.bottomAnchor, constant: 1)
+            ])
+        } else {
+            NSLayoutConstraint.activate([
+                label.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                detail.leadingAnchor.constraint(greaterThanOrEqualTo: label.trailingAnchor, constant: 5),
+                detail.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
+            ])
+        }
         return cell
     }
 }

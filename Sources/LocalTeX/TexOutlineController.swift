@@ -2,17 +2,23 @@ import AppKit
 
 @MainActor
 final class TexOutlineController: NSViewController, NSOutlineViewDataSource, NSOutlineViewDelegate {
+    private struct HeadingKey: Hashable {
+        let title: String
+        let level: Int
+        let file: URL?
+    }
+
     private struct ItemID: Hashable {
-        let heading: String
+        let heading: HeadingKey
         let occurrence: Int
     }
 
     private final class Item {
-        let heading: TeXHeading
+        let heading: TeXOutlineHeading
         let id: ItemID
         var children: [Item] = []
 
-        init(heading: TeXHeading, id: ItemID) {
+        init(heading: TeXOutlineHeading, id: ItemID) {
             self.heading = heading
             self.id = id
         }
@@ -24,10 +30,12 @@ final class TexOutlineController: NSViewController, NSOutlineViewDataSource, NSO
     private var collapsed: Set<ItemID> = []
     private var collapsingItem: ItemID?
     private var isReloading = false
-    private var hasInitialSource = false
+    private var displayedHeadings: [TeXOutlineHeading]?
     private var updateTask: Task<Void, Never>?
 
-    var onNavigate: ((NSRange) -> Void)?
+    var onNavigate: ((TeXOutlineHeading) -> Void)?
+
+    deinit { updateTask?.cancel() }
 
     override func loadView() {
         let panel = NSView()
@@ -46,7 +54,7 @@ final class TexOutlineController: NSViewController, NSOutlineViewDataSource, NSO
         outline.delegate = self
         outline.target = self
         outline.action = #selector(navigate(_:))
-        outline.setAccessibilityLabel("Document outline")
+        outline.setAccessibilityLabel("Project outline")
 
         emptyLabel.font = .systemFont(ofSize: 12)
         emptyLabel.textColor = AppPalette.secondaryText
@@ -67,30 +75,35 @@ final class TexOutlineController: NSViewController, NSOutlineViewDataSource, NSO
         ])
     }
 
-    func update(source: String) {
-        guard hasInitialSource else {
-            hasInitialSource = true
-            reload(source)
-            return
-        }
+    func update(source: @escaping () -> ProjectOutline?) {
         updateTask?.cancel()
         updateTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(120))
+            try? await Task.sleep(for: .milliseconds(160))
+            guard !Task.isCancelled else { return }
+            let snapshot = source()
+            let worker = Task.detached(priority: .utility) { snapshot?.headings() ?? [] }
+            let headings = await withTaskCancellationHandler {
+                await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
             guard !Task.isCancelled, let self else { return }
             self.updateTask = nil
-            self.reload(source)
+            guard self.displayedHeadings != headings else { return }
+            self.displayedHeadings = headings
+            self.reload(headings)
         }
     }
 
-    private func reload(_ source: String) {
+    private func reload(_ headings: [TeXOutlineHeading]) {
         _ = view
         let selected: Item? = outline.selectedRow >= 0 ? outline.item(atRow: outline.selectedRow) as? Item : nil
-        var occurrences: [String: Int] = [:]
+        var occurrences: [HeadingKey: Int] = [:]
         var ancestors: [Item] = []
         var items: [Item] = []
         roots.removeAll()
-        for heading in TeXHeading.parse(source) {
-            let key = "\(heading.level):\(heading.title)"
+        for heading in headings {
+            let key = HeadingKey(title: heading.title, level: heading.level, file: heading.file)
             let occurrence = occurrences[key, default: 0]
             occurrences[key] = occurrence + 1
             let item = Item(heading: heading, id: ItemID(heading: key, occurrence: occurrence))
@@ -129,7 +142,7 @@ final class TexOutlineController: NSViewController, NSOutlineViewDataSource, NSO
     @objc private func navigate(_ sender: NSOutlineView) {
         guard updateTask == nil, sender.clickedRow >= 0,
               let item = sender.item(atRow: sender.clickedRow) as? Item else { return }
-        onNavigate?(item.heading.range)
+        onNavigate?(item.heading)
     }
 
     func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
@@ -193,233 +206,8 @@ final class TexOutlineController: NSViewController, NSOutlineViewDataSource, NSO
         }
         cell.textField?.stringValue = item.heading.title
         cell.textField?.font = .systemFont(ofSize: 13, weight: outlineView.level(forItem: item) == 0 ? .medium : .regular)
+        cell.textField?.toolTip = item.heading.file.map { "\(item.heading.title)\n\($0.lastPathComponent)" }
         cell.needsLayout = true
         return cell
-    }
-}
-
-private struct TeXHeading {
-    let level: Int
-    let title: String
-    let range: NSRange
-
-    private static let levels = [
-        "part": 0, "chapter": 1, "section": 2, "subsection": 3,
-        "subsubsection": 4, "paragraph": 5, "subparagraph": 6
-    ]
-    private static let verbatimEnvironments: Set = [
-        "verbatim", "verbatim*", "Verbatim", "BVerbatim", "LVerbatim", "lstlisting", "minted", "comment"
-    ]
-    private static let textFormatting: Set = [
-        "emph", "textbf", "textit", "textup", "textsl", "textsc",
-        "textrm", "textsf", "texttt", "textnormal", "underline", "mbox"
-    ]
-
-    static func parse(_ text: String) -> [TeXHeading] {
-        var scanner = TeXScanner(text)
-        var headings: [TeXHeading] = []
-        var insideDocument = false
-        while let command = scanner.nextCommand() {
-            if command == "verb" || command == "lstinline" {
-                scanner.skipInlineVerbatim(allowsOptions: command == "lstinline")
-                continue
-            }
-            if command == "begin" || command == "end" {
-                scanner.skipTrivia()
-                guard let range = scanner.readGroup() else { continue }
-                let environment = scanner.source.substring(with: range)
-                if command == "begin" && verbatimEnvironments.contains(environment) {
-                    scanner.skipVerbatimEnvironment(environment)
-                } else if environment == "document" {
-                    if command == "end" && insideDocument { break }
-                    if command == "begin" && !insideDocument {
-                        headings.removeAll()
-                        insideDocument = true
-                    }
-                }
-                continue
-            }
-            guard let level = levels[command] else { continue }
-            scanner.skipTrivia()
-            _ = scanner.consume(TeXScanner.star)
-            scanner.skipTrivia()
-            if scanner.current == TeXScanner.leftBracket {
-                guard scanner.readGroup(optional: true) != nil else { continue }
-                scanner.skipTrivia()
-            }
-            guard let range = scanner.readGroup() else { continue }
-            let title = displayTitle(scanner.source.substring(with: range))
-            headings.append(TeXHeading(level: level, title: title.isEmpty ? "Untitled" : title, range: range))
-        }
-        return headings
-    }
-
-    private static func displayTitle(_ text: String) -> String {
-        var scanner = TeXScanner(text)
-        var title = ""
-        while let character = scanner.current {
-            switch character {
-            case TeXScanner.comment:
-                scanner.skipComment()
-            case TeXScanner.backslash:
-                let start = scanner.offset
-                let command = scanner.readCommand()
-                switch command {
-                case "%", "#", "_", "{", "}", "$", "&": title += command
-                case "\\", " ", "\n", "\r": title += " "
-                case "LaTeX", "TeX": title += command
-                case _ where textFormatting.contains(command): break
-                default:
-                    title += scanner.source.substring(with: NSRange(location: start, length: scanner.offset - start))
-                }
-            case TeXScanner.leftBrace, TeXScanner.rightBrace:
-                scanner.offset += 1
-            case TeXScanner.tilde:
-                scanner.offset += 1
-                title += " "
-            default:
-                let start = scanner.offset
-                scanner.offset += 1
-                while let next = scanner.current,
-                      next != TeXScanner.comment && next != TeXScanner.backslash &&
-                      next != TeXScanner.leftBrace && next != TeXScanner.rightBrace && next != TeXScanner.tilde {
-                    scanner.offset += 1
-                }
-                title += scanner.source.substring(with: NSRange(location: start, length: scanner.offset - start))
-            }
-        }
-        return title.split(whereSeparator: \.isWhitespace).joined(separator: " ")
-    }
-}
-
-private struct TeXScanner {
-    static let backslash: UInt16 = 0x5C
-    static let comment: UInt16 = 0x25
-    static let leftBrace: UInt16 = 0x7B
-    static let rightBrace: UInt16 = 0x7D
-    static let leftBracket: UInt16 = 0x5B
-    static let rightBracket: UInt16 = 0x5D
-    static let star: UInt16 = 0x2A
-    static let tilde: UInt16 = 0x7E
-
-    let source: NSString
-    private let length: Int
-    var offset = 0
-    var current: UInt16? { offset < length ? source.character(at: offset) : nil }
-
-    init(_ text: String) {
-        source = text as NSString
-        length = source.length
-    }
-
-    mutating func nextCommand() -> String? {
-        while let character = current {
-            switch character {
-            case Self.backslash: return readCommand()
-            case Self.comment: skipComment()
-            default: offset += 1
-            }
-        }
-        return nil
-    }
-
-    mutating func readCommand() -> String {
-        offset += 1
-        let start = offset
-        while let character = current, Self.isCommandLetter(character) {
-            offset += 1
-        }
-        if offset == start && offset < length {
-            offset = NSMaxRange(source.rangeOfComposedCharacterSequence(at: offset))
-        }
-        return source.substring(with: NSRange(location: start, length: offset - start))
-    }
-
-    mutating func consume(_ character: UInt16) -> Bool {
-        guard current == character else { return false }
-        offset += 1
-        return true
-    }
-
-    mutating func skipTrivia() {
-        while let character = current {
-            if character == Self.comment {
-                skipComment()
-            } else if Self.isWhitespace(character) {
-                offset += 1
-            } else {
-                break
-            }
-        }
-    }
-
-    mutating func skipComment() {
-        while let character = current, !Self.isNewline(character) {
-            offset += 1
-        }
-        _ = consume(0x0D)
-        _ = consume(0x0A)
-    }
-
-    mutating func readGroup(optional: Bool = false) -> NSRange? {
-        let opening = optional ? Self.leftBracket : Self.leftBrace
-        let closing = optional ? Self.rightBracket : Self.rightBrace
-        guard consume(opening) else { return nil }
-        let start = offset
-        var depth = 1
-        var braces = 0
-        while let character = current {
-            if character == Self.backslash {
-                _ = readCommand()
-            } else if character == Self.comment {
-                skipComment()
-            } else {
-                offset += 1
-                if optional && character == Self.leftBrace {
-                    braces += 1
-                } else if optional && character == Self.rightBrace && braces > 0 {
-                    braces -= 1
-                } else if braces == 0 && character == opening {
-                    depth += 1
-                } else if braces == 0 && character == closing {
-                    depth -= 1
-                    if depth == 0 {
-                        return NSRange(location: start, length: offset - start - 1)
-                    }
-                }
-            }
-        }
-        return nil
-    }
-
-    mutating func skipInlineVerbatim(allowsOptions: Bool) {
-        _ = consume(Self.star)
-        if allowsOptions && current == Self.leftBracket {
-            _ = readGroup(optional: true)
-        }
-        guard let marker = current, !Self.isWhitespace(marker) else { return }
-        let terminator = marker == Self.leftBrace && allowsOptions ? Self.rightBrace : marker
-        offset += 1
-        while let character = current, !Self.isNewline(character) {
-            offset += 1
-            if character == terminator { return }
-        }
-    }
-
-    mutating func skipVerbatimEnvironment(_ name: String) {
-        let range = source.range(of: "\\end{\(name)}", range: NSRange(location: offset, length: length - offset))
-        offset = range.location == NSNotFound ? length : NSMaxRange(range)
-    }
-
-    private static func isCommandLetter(_ character: UInt16) -> Bool {
-        (0x41...0x5A).contains(character) || (0x61...0x7A).contains(character) || character == 0x40
-    }
-
-    private static func isWhitespace(_ character: UInt16) -> Bool {
-        character == 0x20 || (0x09...0x0D).contains(character)
-    }
-
-    private static func isNewline(_ character: UInt16) -> Bool {
-        character == 0x0A || character == 0x0D
     }
 }

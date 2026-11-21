@@ -18,6 +18,7 @@ final class DocumentTabGroup: NSObject {
     private var deferredOpenings: [() -> Void] = []
 
     var workspaceLayout: WorkspaceLayout = .split
+    var pendingProjectPDF: ProjectHistory.PDFPosition?
     var documents: [TeXDocument] { members.compactMap(\.document) }
     var canSwitchTabs: Bool { documents.count > 1 && window?.attachedSheet == nil }
 
@@ -40,9 +41,14 @@ final class DocumentTabGroup: NSObject {
         }
         let isNewWindow = window == nil
         let window = window ?? DocumentTabWindow(tabs: self)
+        var previousPreview: WorkspaceController.TabPreview?
         if active !== document {
             let frame = window.frame
-            let sidebar = (window.contentViewController as? WorkspaceController)?.sidebarLayout
+            let previous = window.contentViewController as? WorkspaceController
+            let sidebar = previous?.sidebarLayout
+            let editorFraction = previous?.editorSplitFraction
+            previousPreview = previous?.rememberPreviewBeforeTabSwitch()
+            active?.workspace?.rememberEditorPositionBeforeTabSwitch()
             active?.workspace?.endTypingGroup()
             window.makeFirstResponder(nil)
             active?.windowControllers.first?.window = nil
@@ -64,12 +70,16 @@ final class DocumentTabGroup: NSObject {
             }
             if let sidebar { workspace.restoreSidebar(sidebar) }
             workspace.setWorkspaceLayout(workspaceLayout)
+            workspace.restoreEditorSplitFraction(editorFraction)
             self.window = window
             workspace.focusEditor()
         }
         refresh()
         if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)
+        workspace.restorePreviewAfterTabSwitch(previousPreview)
+        workspace.restoreProjectPDFIfReady()
+        workspace.restoreEditorPositionAfterTabSwitch()
         noteActiveProject()
         onShown?(true)
     }
@@ -158,6 +168,8 @@ final class DocumentTabGroup: NSObject {
         let wasKey = window.isKeyWindow
         let directory = document.workspace?.projectDirectory
         let sidebar = document.workspace?.sidebarLayout
+        let editorFraction = document.workspace?.editorSplitFraction
+        let preview = document.workspace?.rememberPreviewBeforeTabSwitch()
         window.retainForEmptyWorkspace()
         window.makeFirstResponder(nil)
         document.windowControllers.first?.window = nil
@@ -172,8 +184,11 @@ final class DocumentTabGroup: NSObject {
         if !window.styleMask.contains(.fullScreen) { window.setFrame(frame, display: false) }
         if let sidebar { workspace.restoreSidebar(sidebar) }
         workspace.setWorkspaceLayout(workspaceLayout)
+        workspace.restoreEditorSplitFraction(editorFraction)
         if wasKey { window.makeKeyAndOrderFront(nil) }
         else if !window.isVisible { window.orderFront(nil) }
+        workspace.restorePreviewAfterTabSwitch(preview)
+        workspace.restoreProjectPDFIfReady()
         (NSApp.delegate as? AppDelegate)?.noteProjectChanged(workspace)
         flushOpenings()
     }

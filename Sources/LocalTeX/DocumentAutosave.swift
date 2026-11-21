@@ -7,6 +7,7 @@ final class DocumentAutosave: NSObject {
     private var savesInProgress = 0
     private var changedDuringSave = false
     private var stopped = false
+    var isSaving: Bool { savesInProgress > 0 }
 
     init(document: TeXDocument) {
         self.document = document
@@ -74,21 +75,15 @@ final class DocumentAutosave: NSObject {
             return
         }
 
-        do {
-            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-            guard attributes[.type] as? FileAttributeType == .typeRegular,
-                  let diskDate = attributes[.modificationDate] as? Date,
-                  diskDate == document.fileModificationDate else {
-                document.workspace?.setAutosaveWarning("The file changed outside PageQuoin. Save manually to resolve the conflict.")
-                return
-            }
-        } catch {
-            document.workspace?.setAutosaveWarning(error.localizedDescription)
+        guard document.canWriteDocument(at: url) else {
+            document.checkForExternalFileChanges()
             return
         }
 
         document.save(to: url, ofType: type, for: .saveOperation) { [weak document] error in
-            if let error { document?.workspace?.setAutosaveWarning(error.localizedDescription) }
+            if let error, (error as? CocoaError)?.code != .userCancelled {
+                document?.workspace?.setAutosaveWarning(error.localizedDescription)
+            }
         }
     }
 }

@@ -15,6 +15,10 @@ final class ProjectSearchController: NSWindowController, NSSearchFieldDelegate, 
     private let root: URL
     private let mode: Mode
     private let searchField = NSSearchField()
+    private let replacementField = NSTextField()
+    private let replaceToggle = NSButton(checkboxWithTitle: "Replace", target: nil, action: nil)
+    private let selectFilesButton = NSButton(title: "Select All Files", target: nil, action: nil)
+    private let replacementRow = NSStackView()
     private let table = NSTableView()
     private let status = NSTextField(labelWithString: "Enter text to search")
     private let navigateButton = NSButton(title: "Go to Match", target: nil, action: nil)
@@ -23,6 +27,12 @@ final class ProjectSearchController: NSWindowController, NSSearchFieldDelegate, 
     private var catalog: ProjectFileCatalog?
     private var results: [ProjectSearchResult] = []
     private var selectedResult: ProjectSearchResult?
+    private var replacementFiles: [ProjectReplacementFile] = []
+    private var checkedFiles: Set<URL> = []
+    private var replacementIsLimited = false
+    private var isApplyingReplacement = false
+
+    private var showsReplacement: Bool { !mode.isFileSearch && replaceToggle.state == .on }
 
     var openSourcesProvider: (() -> [URL: String])?
     var onNavigate: ((URL, NSRange) -> Void)?
@@ -64,6 +74,7 @@ final class ProjectSearchController: NSWindowController, NSSearchFieldDelegate, 
                     switch result {
                     case let .text(match): self?.onNavigate?(match.url, match.range)
                     case let .file(entry): self?.onOpenFile?(entry.url)
+                    case .replacementFile: break
                     }
                 }
             }
@@ -72,6 +83,7 @@ final class ProjectSearchController: NSWindowController, NSSearchFieldDelegate, 
     }
 
     @objc func dismiss() {
+        guard !isApplyingReplacement else { return }
         searchTask?.cancel()
         catalogTask?.cancel()
         if let window, let parent = window.sheetParent {
@@ -91,7 +103,40 @@ final class ProjectSearchController: NSWindowController, NSSearchFieldDelegate, 
         searchField.target = self
         searchField.action = #selector(queryChanged(_:))
         searchField.delegate = self
+        searchField.setContentHuggingPriority(.defaultLow, for: .horizontal)
         window.initialFirstResponder = searchField
+
+        let inputControls = NSStackView()
+        inputControls.orientation = .vertical
+        inputControls.alignment = .leading
+        inputControls.spacing = 8
+        inputControls.detachesHiddenViews = true
+        let searchRow = NSStackView(views: [searchField])
+        searchRow.alignment = .centerY
+        searchRow.spacing = 10
+        inputControls.addArrangedSubview(searchRow)
+        searchRow.widthAnchor.constraint(equalTo: inputControls.widthAnchor).isActive = true
+        if !mode.isFileSearch {
+            replaceToggle.target = self
+            replaceToggle.action = #selector(toggleReplacement(_:))
+            replaceToggle.setAccessibilityIdentifier("ProjectReplaceToggle")
+            searchRow.addArrangedSubview(replaceToggle)
+            replacementField.placeholderString = "Replace with (leave empty to remove matches)"
+            replacementField.setAccessibilityLabel("Replacement text")
+            replacementField.setAccessibilityIdentifier("ProjectReplacementText")
+            replacementField.delegate = self
+            replacementField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            selectFilesButton.target = self
+            selectFilesButton.action = #selector(toggleAllFiles(_:))
+            selectFilesButton.isEnabled = false
+            replacementRow.alignment = .centerY
+            replacementRow.spacing = 10
+            replacementRow.addArrangedSubview(replacementField)
+            replacementRow.addArrangedSubview(selectFilesButton)
+            inputControls.addArrangedSubview(replacementRow)
+            replacementRow.widthAnchor.constraint(equalTo: inputControls.widthAnchor).isActive = true
+            replacementRow.isHidden = true
+        }
 
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("Match"))
         column.resizingMask = .autoresizingMask
@@ -125,17 +170,17 @@ final class ProjectSearchController: NSWindowController, NSSearchFieldDelegate, 
         navigateButton.keyEquivalent = "\r"
         navigateButton.isEnabled = false
 
-        for child in [searchField, scroll, status, cancel, navigateButton] {
+        for child in [inputControls, scroll, status, cancel, navigateButton] {
             child.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(child)
         }
         NSLayoutConstraint.activate([
-            searchField.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
-            searchField.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
-            searchField.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
-            scroll.leadingAnchor.constraint(equalTo: searchField.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: searchField.trailingAnchor),
-            scroll.topAnchor.constraint(equalTo: searchField.bottomAnchor, constant: 12),
+            inputControls.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
+            inputControls.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            inputControls.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
+            scroll.leadingAnchor.constraint(equalTo: inputControls.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: inputControls.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: inputControls.bottomAnchor, constant: 12),
             scroll.bottomAnchor.constraint(equalTo: navigateButton.topAnchor, constant: -14),
             status.leadingAnchor.constraint(equalTo: scroll.leadingAnchor),
             status.centerYAnchor.constraint(equalTo: navigateButton.centerYAnchor),
@@ -155,9 +200,20 @@ final class ProjectSearchController: NSWindowController, NSSearchFieldDelegate, 
         }
     }
 
+    @objc private func toggleReplacement(_ sender: Any?) {
+        replacementRow.isHidden = !showsReplacement
+        navigateButton.title = showsReplacement ? "Replace Checked Files…" : "Go to Match"
+        navigateButton.keyEquivalent = showsReplacement ? "" : "\r"
+        queryChanged(searchField)
+    }
+
     private func searchText(_ query: String, openSources: [URL: String]) {
         searchTask?.cancel()
+        checkedFiles.removeAll()
+        replacementFiles.removeAll()
+        replacementIsLimited = false
         replaceResults([])
+        status.toolTip = nil
         guard !query.isEmpty else {
             status.stringValue = "Enter text to search"
             return
@@ -165,11 +221,16 @@ final class ProjectSearchController: NSWindowController, NSSearchFieldDelegate, 
         status.stringValue = "Searching…"
         let root = root
         let sources = openSourcesProvider?() ?? openSources
+        let replacement = showsReplacement ? replacementField.stringValue : nil
+        if let replacement, replacement.utf8.count > ProjectReplacementFile.fileSizeLimit {
+            status.stringValue = "Replacement text is too large"
+            return
+        }
         searchTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(180))
             guard !Task.isCancelled else { return }
             let work = Task.detached(priority: .userInitiated) {
-                ProjectSearch.find(query: query, root: root, openSources: sources)
+                ProjectSearch.find(query: query, root: root, openSources: sources, replacement: replacement)
             }
             let batch = await withTaskCancellationHandler {
                 await work.value
@@ -182,16 +243,30 @@ final class ProjectSearchController: NSWindowController, NSSearchFieldDelegate, 
     }
 
     private func showResults(_ batch: ProjectSearch.Batch) {
-        replaceResults(batch.matches.map(ProjectSearchResult.text))
+        replacementFiles = batch.replacementFiles
+        replacementIsLimited = batch.limited
+        if showsReplacement {
+            let grouped = Dictionary(grouping: batch.matches, by: \.url)
+            replaceResults(replacementFiles.flatMap { file in
+                [.replacementFile(file)] + (grouped[file.url] ?? []).map(ProjectSearchResult.text)
+            })
+        } else {
+            replaceResults(batch.matches.map(ProjectSearchResult.text))
+        }
         if batch.inaccessible {
             status.stringValue = "Could not read the project folder"
             return
         }
         let count = batch.matches.count
         let matches = count == 1 ? "1 match" : "\(count) matches"
+        if showsReplacement && batch.limited {
+            status.stringValue = "Too many matches to replace. Narrow the search."
+            return
+        }
         let summary = batch.limited ? "Showing the first \(matches)" : matches
         let skipped = batch.skippedFiles
-        status.stringValue = skipped == 0 ? summary : "\(summary) · \(skipped) skipped (too large or unreadable)"
+        status.stringValue = skipped == 0 ? summary : "\(summary) · \(skipped) files skipped"
+        if skipped > 0 { status.toolTip = "Some files were too large or could not be read." }
     }
 
     private func loadFileCatalog(openFiles: [URL]) {
@@ -246,18 +321,34 @@ final class ProjectSearchController: NSWindowController, NSSearchFieldDelegate, 
             table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
             table.scrollRowToVisible(0)
         }
-        navigateButton.isEnabled = !results.isEmpty
+        updateActions()
     }
 
     @objc private func navigate(_ sender: Any?) {
+        if showsReplacement, sender as? NSButton === navigateButton {
+            confirmReplacement()
+            return
+        }
         let row = sender as? NSTableView === table && table.clickedRow >= 0 ? table.clickedRow : table.selectedRow
         guard results.indices.contains(row), let window, let parent = window.sheetParent else { return }
+        if case let .replacementFile(file) = results[row] {
+            setChecked(!checkedFiles.contains(file.url), for: file.url)
+            table.reloadData(forRowIndexes: IndexSet(integer: row), columnIndexes: IndexSet(integer: 0))
+            return
+        }
         selectedResult = results[row]
         parent.endSheet(window, returnCode: .OK)
     }
 
+    func controlTextDidChange(_ notification: Notification) {
+        if notification.object as? NSTextField === replacementField { queryChanged(searchField) }
+    }
+
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
         switch commandSelector {
+        case #selector(NSResponder.insertNewline(_:)) where showsReplacement:
+            queryChanged(searchField)
+            return true
         case #selector(NSResponder.insertNewline(_:)):
             navigate(control)
             return true
@@ -287,7 +378,7 @@ final class ProjectSearchController: NSWindowController, NSSearchFieldDelegate, 
     func numberOfRows(in tableView: NSTableView) -> Int { results.count }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
-        navigateButton.isEnabled = results.indices.contains(table.selectedRow)
+        updateActions()
     }
 
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
@@ -295,17 +386,152 @@ final class ProjectSearchController: NSWindowController, NSSearchFieldDelegate, 
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        if case let .replacementFile(file) = results[row] {
+            let identifier = NSUserInterfaceItemIdentifier("ReplacementFileCell")
+            let cell = table.makeView(withIdentifier: identifier, owner: self) as? ReplacementFileCell ?? ReplacementFileCell()
+            cell.identifier = identifier
+            cell.update(file, checked: checkedFiles.contains(file.url), enabled: !replacementIsLimited && !isApplyingReplacement)
+            cell.onToggle = { [weak self] checked in self?.setChecked(checked, for: file.url) }
+            return cell
+        }
         let identifier = NSUserInterfaceItemIdentifier("SearchMatchCell")
         let cell = table.makeView(withIdentifier: identifier, owner: self) as? SearchMatchCell ?? SearchMatchCell()
         cell.identifier = identifier
         cell.update(results[row])
         return cell
     }
+
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        switch results[row] {
+        case .replacementFile: 30
+        case let .text(match) where match.after != nil: 57
+        default: tableView.rowHeight
+        }
+    }
+
+    private func setChecked(_ checked: Bool, for url: URL) {
+        if checked { checkedFiles.insert(url) }
+        else { checkedFiles.remove(url) }
+        updateActions()
+    }
+
+    @objc private func toggleAllFiles(_ sender: Any?) {
+        if checkedFiles.count == replacementFiles.count { checkedFiles.removeAll() }
+        else { checkedFiles = Set(replacementFiles.map(\.url)) }
+        table.reloadData()
+        updateActions()
+    }
+
+    private func updateActions() {
+        if showsReplacement {
+            navigateButton.isEnabled = !checkedFiles.isEmpty && !replacementIsLimited && !isApplyingReplacement
+            selectFilesButton.isEnabled = !replacementFiles.isEmpty && !replacementIsLimited && !isApplyingReplacement
+            selectFilesButton.title = !checkedFiles.isEmpty && checkedFiles.count == replacementFiles.count
+                ? "Deselect All Files" : "Select All Files"
+        } else {
+            navigateButton.isEnabled = results.indices.contains(table.selectedRow)
+        }
+    }
+
+    private func confirmReplacement() {
+        guard !isApplyingReplacement, !replacementIsLimited, !checkedFiles.isEmpty, let window else { return }
+        let files = replacementFiles.filter { checkedFiles.contains($0.url) }
+        let matchCount = files.reduce(0) { $0 + $1.ranges.count }
+        let replacement = replacementField.stringValue
+        guard replacement.utf8.count * matchCount <= 16 * 1024 * 1024 else {
+            status.stringValue = "This replacement is too large. Select fewer files."
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Replace \(matchCount) \(matchCount == 1 ? "match" : "matches") in \(files.count) \(files.count == 1 ? "file" : "files")?"
+        alert.informativeText = "Open tabs receive an undoable edit. Closed files are updated on disk. Files changed since the preview are skipped."
+        alert.addButton(withTitle: "Replace")
+        alert.addButton(withTitle: "Cancel").keyEquivalent = "\u{1b}"
+        isApplyingReplacement = true
+        updateActions()
+        table.reloadData()
+        Task {
+            if await alert.beginSheetModal(for: window) == .alertFirstButtonReturn {
+                await applyReplacement(files, replacement: replacement)
+            }
+            isApplyingReplacement = false
+            table.reloadData()
+            updateActions()
+        }
+    }
+
+    private func applyReplacement(_ files: [ProjectReplacementFile], replacement: String) async {
+        searchField.isEnabled = false
+        replaceToggle.isEnabled = false
+        replacementField.isEnabled = false
+        status.stringValue = "Replacing…"
+        defer {
+            searchField.isEnabled = true
+            replaceToggle.isEnabled = true
+            replacementField.isEnabled = true
+        }
+
+        let root = ProjectHistory.normalized(root)
+        var matchCount = 0
+        var updatedCount = 0
+        var wroteClosedFile = false
+        var skipped: [String] = []
+        for file in files {
+            do {
+                if let document = openDocument(at: file.url) {
+                    guard !document.isSavingDocument else { throw ReplacementError.editorUnavailable }
+                    _ = try file.validateDisk(in: root)
+                    let documentURL = document.fileURL ?? file.url
+                    let diskMatches = document.diskBaseline(at: documentURL).map {
+                        $0.digest == file.version.digest && $0.version.matchesFileMetadata(of: file.version.disk)
+                    } ?? (document.fileModificationDate == file.version.disk.modificationDate)
+                    guard diskMatches,
+                          ProjectReplacementFile.sourceDigest(document.source) == file.sourceDigest else {
+                        throw ReplacementError.changed
+                    }
+                    guard document.workspace?.applyProjectReplacement(file, replacement: replacement) == true else {
+                        throw ReplacementError.editorUnavailable
+                    }
+                } else {
+                    try file.write(toClosedFileIn: root, replacement: replacement)
+                    wroteClosedFile = true
+                }
+                updatedCount += 1
+                matchCount += file.ranges.count
+            } catch {
+                skipped.append("\(file.path) — \(error.localizedDescription)")
+            }
+            await Task.yield()
+        }
+        if wroteClosedFile { ProjectBuildSession.sourcesDidChange(in: root) }
+        checkedFiles.removeAll()
+        replacementFiles.removeAll()
+        replaceResults([])
+        let summary = "Replaced \(matchCount) \(matchCount == 1 ? "match" : "matches") in \(updatedCount) \(updatedCount == 1 ? "file" : "files")"
+        status.stringValue = skipped.isEmpty ? summary : "\(summary) · \(skipped.count) skipped"
+        status.toolTip = ([status.stringValue] + skipped + ["Press Return in the search field to refresh the preview."])
+            .joined(separator: "\n")
+        if !skipped.isEmpty, let window {
+            let alert = NSAlert()
+            alert.messageText = status.stringValue
+            alert.informativeText = skipped.prefix(5).joined(separator: "\n\n")
+            if skipped.count > 5 { alert.informativeText += "\n\nHover over the result summary to review all skipped files." }
+            alert.addButton(withTitle: "OK")
+            _ = await alert.beginSheetModal(for: window)
+        }
+    }
+
+    private func openDocument(at url: URL) -> TeXDocument? {
+        NSDocumentController.shared.documents.lazy.compactMap { $0 as? TeXDocument }.first {
+            $0.fileURL.map(ProjectHistory.normalized)?.path == url.path
+        }
+    }
 }
 
 private enum ProjectSearchResult {
     case text(ProjectMatch)
     case file(ProjectFileCatalog.Entry)
+    case replacementFile(ProjectReplacementFile)
 }
 
 private struct ProjectFileCatalog: Sendable {
@@ -401,21 +627,24 @@ private struct ProjectMatch: Sendable {
     let path: String
     let line: Int
     let preview: String
+    let after: String?
     let range: NSRange
 }
 
 private enum ProjectSearch {
     struct Batch: Sendable {
         var matches: [ProjectMatch] = []
+        var replacementFiles: [ProjectReplacementFile] = []
         var skippedFiles = 0
         var limited = false
         var inaccessible = false
     }
 
     private static let resultLimit = 200
-    private static let fileSizeLimit = 2 * 1024 * 1024
+    private static let replacementLimit = 2_000
+    private static let fileSizeLimit = ProjectReplacementFile.fileSizeLimit
 
-    static func find(query: String, root: URL, openSources: [URL: String]) -> Batch {
+    static func find(query: String, root: URL, openSources: [URL: String], replacement: String?) -> Batch {
         var batch = Batch()
         let root = root.resolvingSymlinksInPath().standardizedFileURL
         var isDirectory: ObjCBool = false
@@ -444,25 +673,45 @@ private enum ProjectSearch {
                   ProjectFileKind.detect(for: file)?.isEditable == true else { continue }
             let file = file.standardizedFileURL
             let source: String?
-            if let snapshot = snapshots[file.path] {
+            let version: ProjectReplacementFile.Version?
+            if replacement != nil {
+                guard let (data, state) = try? ProjectReplacementFile.read(file, in: root),
+                      let decoded = ProjectTextEncoding.decode(data) else {
+                    batch.skippedFiles += 1
+                    continue
+                }
+                let text = snapshots[file.path] ?? decoded.text
+                source = text.utf8.count <= fileSizeLimit ? text : nil
+                version = state
+            } else if let snapshot = snapshots[file.path] {
                 source = snapshot.utf8.count <= fileSizeLimit ? snapshot : nil
+                version = nil
             } else if let size = info.fileSize, size <= fileSizeLimit {
                 source = read(file)
+                version = nil
             } else {
                 source = nil
+                version = nil
             }
             guard let source else {
                 batch.skippedFiles += 1
                 continue
             }
             let path = file.pathComponents.dropFirst(rootDepth).joined(separator: "/")
-            collectMatches(in: source as NSString, query: query, file: file, path: path, batch: &batch)
+            let start = batch.matches.endIndex
+            collectMatches(in: source as NSString, query: query, replacement: replacement, file: file, path: path,
+                           batch: &batch)
+            if let version, start < batch.matches.endIndex {
+                batch.replacementFiles.append(ProjectReplacementFile(url: file, path: path, version: version,
+                    sourceDigest: ProjectReplacementFile.sourceDigest(source), ranges: batch.matches[start...].map(\.range)))
+            }
             if batch.limited { break }
         }
         batch.matches.sort { a, b in
             if a.path == b.path { return a.range.location < b.range.location }
             return a.path.localizedStandardCompare(b.path) == .orderedAscending
         }
+        batch.replacementFiles.sort { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
         return batch
     }
 
@@ -472,17 +721,25 @@ private enum ProjectSearch {
         return ProjectTextEncoding.decode(data)?.text
     }
 
-    private static func collectMatches(in source: NSString, query: String, file: URL, path: String, batch: inout Batch) {
+    private static func collectMatches(in source: NSString, query: String, replacement: String?, file: URL,
+                                       path: String, batch: inout Batch) {
         var offset = 0
         var line = 0
         var lineStart = 0
         var nextLine = 0
         var lineTextEnd = 0
+        let limit = replacement == nil ? resultLimit : replacementLimit
+        let previewReplacement = replacement.map { text in
+            let preview = String(text.prefix(88))
+            return preview == text ? preview : preview + "…"
+        }
         while offset < source.length && !Task.isCancelled {
             let remaining = NSRange(location: offset, length: source.length - offset)
             let match = source.range(of: query, options: .caseInsensitive, range: remaining)
             guard match.location != NSNotFound, match.length > 0 else { break }
-            if batch.matches.count == resultLimit {
+            offset = NSMaxRange(match)
+            if let replacement, replacement.utf8.elementsEqual(source.substring(with: match).utf8) { continue }
+            if batch.matches.count == limit {
                 batch.limited = true
                 break
             }
@@ -494,9 +751,16 @@ private enum ProjectSearch {
             let start = max(lineStart, match.location - 40)
             let end = min(lineTextEnd, match.location + min(match.length, 90) + 60)
             let range = source.rangeOfComposedCharacterSequences(for: NSRange(location: start, length: max(0, end - start)))
-            let preview = (start > lineStart ? "…" : "") + source.substring(with: range) + (end < lineTextEnd ? "…" : "")
-            batch.matches.append(ProjectMatch(url: file, path: path, line: line, preview: preview, range: match))
-            offset = NSMaxRange(match)
+            let leading = start > lineStart ? "…" : ""
+            let trailing = end < lineTextEnd ? "…" : ""
+            let preview = leading + source.substring(with: range) + trailing
+            let after = previewReplacement.map { replacement in
+                let before = source.substring(with: NSRange(location: range.location, length: max(0, match.location - range.location)))
+                let tailStart = min(offset, NSMaxRange(range))
+                let tail = source.substring(with: NSRange(location: tailStart, length: NSMaxRange(range) - tailStart))
+                return leading + before + replacement + tail + trailing
+            }
+            batch.matches.append(ProjectMatch(url: file, path: path, line: line, preview: preview, after: after, range: match))
         }
     }
 }
@@ -505,6 +769,7 @@ private enum ProjectSearch {
 private final class SearchMatchCell: NSTableCellView {
     private let path = NSTextField(labelWithString: "")
     private let snippet = NSTextField(labelWithString: "")
+    private let replacementSnippet = NSTextField(labelWithString: "")
     private let icon = NSImageView()
     private lazy var labelLeading = path.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8)
     private lazy var labelTop = path.topAnchor.constraint(equalTo: topAnchor, constant: 4)
@@ -515,11 +780,13 @@ private final class SearchMatchCell: NSTableCellView {
         path.textColor = AppPalette.text
         snippet.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         snippet.textColor = AppPalette.text
+        replacementSnippet.font = snippet.font
+        replacementSnippet.textColor = AppPalette.success
         icon.translatesAutoresizingMaskIntoConstraints = false
         icon.contentTintColor = AppPalette.secondaryText
         icon.symbolConfiguration = .init(pointSize: 14, weight: .medium)
         addSubview(icon)
-        for label in [path, snippet] {
+        for label in [path, snippet, replacementSnippet] {
             label.lineBreakMode = .byTruncatingTail
             label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
             label.translatesAutoresizingMaskIntoConstraints = false
@@ -535,7 +802,10 @@ private final class SearchMatchCell: NSTableCellView {
             labelTop,
             snippet.leadingAnchor.constraint(equalTo: path.leadingAnchor),
             snippet.trailingAnchor.constraint(equalTo: path.trailingAnchor),
-            snippet.topAnchor.constraint(equalTo: path.bottomAnchor, constant: 2)
+            snippet.topAnchor.constraint(equalTo: path.bottomAnchor, constant: 2),
+            replacementSnippet.leadingAnchor.constraint(equalTo: path.leadingAnchor),
+            replacementSnippet.trailingAnchor.constraint(equalTo: path.trailingAnchor),
+            replacementSnippet.topAnchor.constraint(equalTo: snippet.bottomAnchor, constant: 2)
         ])
     }
 
@@ -545,14 +815,19 @@ private final class SearchMatchCell: NSTableCellView {
         switch result {
         case let .text(match):
             icon.isHidden = true
+            replacementSnippet.isHidden = match.after == nil
             labelLeading.constant = 8
             labelTop.constant = 4
             path.stringValue = "\(match.path):\(match.line)"
-            snippet.stringValue = match.preview
-            toolTip = path.stringValue + "\n" + match.preview
-            setAccessibilityLabel(path.stringValue + ", " + match.preview)
+            snippet.textColor = match.after == nil ? AppPalette.text : AppPalette.error
+            snippet.stringValue = match.after == nil ? match.preview : "− " + match.preview
+            replacementSnippet.stringValue = match.after.map { "+ " + $0 } ?? ""
+            let description = [path.stringValue, snippet.stringValue, replacementSnippet.stringValue].filter { !$0.isEmpty }
+            toolTip = description.joined(separator: "\n")
+            setAccessibilityLabel(description.joined(separator: ", "))
         case let .file(entry):
             icon.isHidden = false
+            replacementSnippet.isHidden = true
             icon.image = NSImage(systemSymbolName: entry.symbol, accessibilityDescription: nil)
             labelLeading.constant = 36
             let name = entry.url.lastPathComponent
@@ -565,6 +840,38 @@ private final class SearchMatchCell: NSTableCellView {
             snippet.stringValue = isNested ? entry.path : ""
             toolTip = entry.path
             setAccessibilityLabel(entry.path)
+        case .replacementFile:
+            break
         }
     }
+}
+
+@MainActor
+private final class ReplacementFileCell: NSTableCellView {
+    private lazy var checkbox = NSButton(checkboxWithTitle: "", target: self, action: #selector(toggle(_:)))
+    var onToggle: ((Bool) -> Void)?
+
+    init() {
+        super.init(frame: .zero)
+        checkbox.font = .systemFont(ofSize: 12, weight: .medium)
+        checkbox.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(checkbox)
+        NSLayoutConstraint.activate([
+            checkbox.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            checkbox.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8),
+            checkbox.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    func update(_ file: ProjectReplacementFile, checked: Bool, enabled: Bool) {
+        let count = file.ranges.count
+        checkbox.title = "\(file.path) · \(count) \(count == 1 ? "match" : "matches")"
+        checkbox.state = checked ? .on : .off
+        checkbox.isEnabled = enabled
+        checkbox.toolTip = file.path
+    }
+
+    @objc private func toggle(_ sender: NSButton) { onToggle?(sender.state == .on) }
 }

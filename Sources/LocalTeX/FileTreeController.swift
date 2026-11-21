@@ -31,6 +31,7 @@ final class FileTreeController: NSViewController, NSOutlineViewDataSource, NSOut
     var onCreateEntry: ((CreationKind, URL) -> Void)?
     var onChooseRoot: (() -> Void)?
     var onSetMainFile: ((URL) -> Void)?
+    var onRefresh: (() -> Void)?
 
     override func loadView() {
         let container = NSView()
@@ -249,7 +250,10 @@ final class FileTreeController: NSViewController, NSOutlineViewDataSource, NSOut
     }
 
     @objc private func chooseRoot(_ sender: Any?) { onChooseRoot?() }
-    @objc private func refresh(_ sender: Any?) { reload() }
+    @objc private func refresh(_ sender: Any?) {
+        reload()
+        onRefresh?()
+    }
     @objc private func createFile(_ sender: Any?) { requestCreation(.file) }
     @objc private func createFolder(_ sender: Any?) { requestCreation(.folder) }
 

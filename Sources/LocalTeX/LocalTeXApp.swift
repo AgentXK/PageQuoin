@@ -55,6 +55,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     private var projectOpenTask: Task<Void, Never>?
     private var editorSettings: EditorSettingsController?
     private var receivedExternalOpen = false
+    private var startupBuildPending = true
     private var projectBeforeQuit: ProjectHistory.Project?
     private var isFinishingQuit = false
 
@@ -70,25 +71,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     func applicationWillFinishLaunching(_ notification: Notification) {
         NotificationCenter.default.addObserver(self, selector: #selector(projectWindowBecameMain(_:)),
                                                name: NSWindow.didBecomeMainNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(projectWindowResignedMain(_:)),
+                                               name: NSWindow.didResignMainNotification, object: nil)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.activate(ignoringOtherApps: true)
         Task { [weak self] in
-            guard let self, !receivedExternalOpen,
-                  projectOpenTask == nil,
-                  !NSApp.orderedWindows.contains(where: { $0.contentViewController is WorkspaceController }) else { return }
+            guard let self, !receivedExternalOpen, projectOpenTask == nil else { return }
+            if let visible = workspace ?? NSApp.orderedWindows.lazy.compactMap({
+                $0.contentViewController as? WorkspaceController
+            }).first {
+                finishStartupBuild(in: visible)
+                return
+            }
             let controller = NSDocumentController.shared
             if let existing = controller.documents.first(where: { $0.fileURL != nil || $0.isDocumentEdited }) {
                 existing.showWindows()
+                finishStartupBuild(in: (existing as? TeXDocument)?.workspace)
             } else if let project = projectHistory.recentProjects().first {
                 // AppKit may prepare an invisible, unedited untitled document at launch.
                 for document in controller.documents { document.close() }
                 openProject(project)
-            } else if let existing = controller.documents.first {
-                existing.showWindows()
             } else {
-                controller.newDocument(nil)
+                if let existing = controller.documents.first { existing.showWindows() }
+                else { controller.newDocument(nil) }
+                finishStartupBuild(in: nil)
             }
         }
     }
@@ -100,20 +108,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
     func application(_ sender: NSApplication, openFiles filenames: [String]) {
         guard !filenames.isEmpty else { return }
+        let startupProjects = startupBuildPending ? projectHistory.recentProjects() : []
         receivedExternalOpen = true
         let pending = projectOpenTask
         pending?.cancel()
         Task {
             await pending?.value
             var failure: Error?
+            var openedWorkspace: WorkspaceController?
             for filename in filenames {
                 do {
-                    _ = try await NSDocumentController.shared.openDocument(withContentsOf: URL(fileURLWithPath: filename),
-                                                                           display: true)
+                    let (document, _) = try await NSDocumentController.shared
+                        .openDocument(withContentsOf: URL(fileURLWithPath: filename), display: true)
+                    openedWorkspace = (document as? TeXDocument)?.workspace
                 } catch {
                     if failure == nil { failure = error }
                 }
             }
+            if startupBuildPending, let openedWorkspace, let directory = openedWorkspace.projectDirectory {
+                let root = ProjectHistory.normalized(directory)
+                if let state = startupProjects.first(where: { $0.directory == root })?.workspaceState {
+                    openedWorkspace.restoreProjectWorkspace(state)
+                }
+            }
+            finishStartupBuild(in: openedWorkspace)
             sender.reply(toOpenOrPrint: failure == nil ? .success : .failure)
             if let failure { sender.presentError(failure) }
         }
@@ -138,7 +156,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     }
 
     func captureProjectBeforeQuit() {
-        let current = projectOpenTask == nil ? workspace.flatMap(snapshot) : nil
+        let active = workspace ?? NSApp.orderedWindows.lazy.compactMap { $0.contentViewController as? WorkspaceController }.first
+        let current = projectOpenTask == nil ? active.flatMap(snapshot) : nil
         projectBeforeQuit = current ?? projectHistory.recentProjects().first
     }
 
@@ -154,10 +173,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         }
     }
 
+    @objc private func projectWindowResignedMain(_ notification: Notification) {
+        guard !isFinishingQuit, projectOpenTask == nil,
+              let candidate = (notification.object as? NSWindow)?.contentViewController as? WorkspaceController,
+              let project = snapshot(candidate) else { return }
+        projectHistory.update(project)
+    }
+
     private func snapshot(_ workspace: WorkspaceController) -> ProjectHistory.Project? {
         guard let directory = workspace.projectDirectory else { return nil }
+        var positions: [String: ProjectHistory.EditorPosition] = [:]
+        for document in workspace.documentTabs?.documents ?? [] {
+            if let file = document.fileURL, let position = document.workspace?.editorPosition {
+                positions[ProjectHistory.normalized(file).path] = position
+            }
+        }
         return projectHistory.snapshot(directory: directory, activeFile: workspace.documentURL,
-                                       openFiles: workspace.projectTabDocumentURLs)
+                                       openFiles: workspace.projectTabDocumentURLs, editorPositions: positions,
+                                       workspaceState: workspace.projectWorkspaceState)
     }
 
     @objc private func showEditorSettings(_ sender: Any?) {
@@ -250,7 +283,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         addRecentProjects(to: menu, currentDirectory: nil)
     }
 
-    func projectMenu(for directory: URL?) -> NSMenu {
+    func projectMenu(for directory: URL?, mainDocuments: NSMenu?) -> NSMenu {
         let menu = NSMenu()
         let choose = menu.addItem(withTitle: "Open Project Folder…", action: #selector(chooseProject(_:)), keyEquivalent: "")
         choose.target = self
@@ -258,6 +291,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             let reveal = menu.addItem(withTitle: "Show Project in Finder", action: #selector(revealProject(_:)), keyEquivalent: "")
             reveal.target = self
             reveal.representedObject = directory
+            if let mainDocuments {
+                let main = NSMenuItem(title: mainDocuments.title, action: nil, keyEquivalent: "")
+                main.submenu = mainDocuments
+                menu.addItem(main)
+            }
         }
         menu.addItem(.separator())
         addRecentProjects(to: menu, currentDirectory: directory)
@@ -296,6 +334,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
     private func openProject(_ project: ProjectHistory.Project) {
         guard projectOpenTask == nil else { return }
+        if let workspace, let current = snapshot(workspace), current.directory != project.directory {
+            projectHistory.update(current)
+        }
         if let window = NSApp.orderedWindows.first(where: { window in
             guard let workspace = window.contentViewController as? WorkspaceController,
                   let directory = workspace.projectDirectory else { return false }
@@ -303,30 +344,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         }) {
             if window.isMiniaturized { window.deminiaturize(nil) }
             window.makeKeyAndOrderFront(nil)
+            if !receivedExternalOpen { finishStartupBuild(in: window.contentViewController as? WorkspaceController) }
             return
         }
         projectOpenTask = Task {
             let restored = await restoreProject(project)
             let cancelled = Task.isCancelled
+            if !cancelled, let restored, let state = project.workspaceState {
+                restored.restoreProjectWorkspace(state)
+                if let path = restored.documentURL.map(ProjectHistory.normalized)?.path,
+                   let position = project.editorPositions?[path] { restored.restoreEditorPosition(position) }
+            }
             projectOpenTask = nil
-            if let restored, !cancelled, let session = snapshot(restored) { projectHistory.record(session) }
+            guard !cancelled else { return }
+            if let restored, let session = snapshot(restored) { projectHistory.record(session) }
+            if !receivedExternalOpen { finishStartupBuild(in: restored) }
         }
+    }
+
+    private func finishStartupBuild(in workspace: WorkspaceController?) {
+        guard startupBuildPending else { return }
+        startupBuildPending = false
+        if !isFinishingQuit { workspace?.compileAtStartup() }
     }
 
     private func restoreProject(_ project: ProjectHistory.Project) async -> WorkspaceController? {
         var current: WorkspaceController?
         for file in project.openFiles {
             guard !Task.isCancelled else { return nil }
+            let opened: WorkspaceController?
             if let previous = current {
-                if let opened = await openTab(file, in: previous) { current = opened }
+                opened = await openTab(file, in: previous)
             } else {
-                current = await openProjectFile(file, directory: project.directory)
+                opened = await openProjectFile(file, directory: project.directory)
+            }
+            if let opened {
+                current = opened
+                if let position = project.editorPositions?[file.path] { opened.restoreEditorPosition(position) }
             }
         }
         if let current {
             guard !Task.isCancelled else { return nil }
-            if let file = project.activeFile, current.documentURL.map(ProjectHistory.normalized)?.path != file.path {
-                return await openTab(file, in: current) ?? current
+            if let file = project.activeFile, current.documentURL.map(ProjectHistory.normalized)?.path != file.path,
+               let active = await openTab(file, in: current) {
+                if let position = project.editorPositions?[file.path] { active.restoreEditorPosition(position) }
+                return active
             }
             return current
         }
@@ -379,6 +441,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     }
 
     @objc private func compile(_ sender: Any?) { workspace?.compile(sender) }
+    @objc private func stopCompilation(_ sender: Any?) { workspace?.stopCompilation() }
     @objc private func showSourceInPDF(_ sender: Any?) { workspace?.showSourceInPDF() }
     @objc private func showBuildFiles(_ sender: Any?) { workspace?.showBuildFiles() }
     @objc private func cleanBuildFiles(_ sender: Any?) { workspace?.cleanBuildFiles() }
@@ -394,6 +457,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
     @objc private func zoomIn(_ sender: Any?) { workspace?.zoomIn(sender) }
     @objc private func zoomOut(_ sender: Any?) { workspace?.zoomOut(sender) }
     @objc private func fitPDF(_ sender: Any?) { workspace?.fitPDF(sender) }
+
+    @objc private func findInDocument(_ item: NSMenuItem) {
+        if let workspace, workspace.hasPDFFindFocus, let action = NSTextFinder.Action(rawValue: item.tag) {
+            workspace.findInPDF(action)
+        } else {
+            NSApp.sendAction(#selector(NSResponder.performTextFinderAction(_:)), to: nil, from: item)
+        }
+    }
+
+    @objc private func findInPDF(_ sender: Any?) { workspace?.findInPDF() }
 
     @objc private func chooseEngine(_ sender: Any?) {
         let panel = NSOpenPanel()
@@ -461,6 +534,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         }
         return switch item.action {
         case #selector(compile(_:)): workspace?.canCompile == true
+        case #selector(stopCompilation(_:)): workspace?.canStopCompilation == true
         case #selector(showSourceInPDF(_:)): workspace?.canShowSourceInPDF == true
         case #selector(showBuildFiles(_:)): workspace?.buildFilesDirectory != nil
         case #selector(cleanBuildFiles(_:)): workspace?.canCleanBuildFiles == true
@@ -468,6 +542,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         case #selector(zoomIn(_:)): workspace?.canZoomIn == true
         case #selector(zoomOut(_:)): workspace?.canZoomOut == true
         case #selector(fitPDF(_:)): workspace?.canExport == true
+        case #selector(findInDocument(_:)): workspace?.hasPDFFindFocus == true
+            || NSApp.target(forAction: #selector(NSResponder.performTextFinderAction(_:))) != nil
+        case #selector(findInPDF(_:)): workspace?.canSearchPDF == true
         case #selector(searchProject(_:)), #selector(quickOpen(_:)): workspace?.canSearchProject == true
         case #selector(toggleSidebar(_:)): workspace != nil
         case #selector(toggleLog(_:)), #selector(toggleAutoCompile(_:)): workspace?.hasBuildTarget == true
@@ -536,10 +613,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         add(edit, "Paste", #selector(NSText.paste(_:)), "v")
         add(edit, "Select All", #selector(NSText.selectAll(_:)), "a")
         edit.addItem(.separator())
-        let find = NSMenuItem(title: "Find…", action: #selector(NSResponder.performTextFinderAction(_:)),
-                              keyEquivalent: "f")
-        find.tag = NSTextFinder.Action.showFindInterface.rawValue
-        edit.addItem(find)
+        let findActions: [(String, String, NSTextFinder.Action, NSEvent.ModifierFlags)] = [
+            ("Find…", "f", .showFindInterface, [.command]),
+            ("Find Next", "g", .nextMatch, [.command]),
+            ("Find Previous", "g", .previousMatch, [.command, .shift])
+        ]
+        for (title, key, action, modifiers) in findActions {
+            let item = NSMenuItem(title: title, action: #selector(findInDocument(_:)), keyEquivalent: key)
+            item.target = self
+            item.tag = action.rawValue
+            item.keyEquivalentModifierMask = modifiers
+            edit.addItem(item)
+        }
+        add(edit, "Find in PDF…", #selector(findInPDF(_:)), "f", target: self, modifiers: [.command, .option])
         add(edit, "Find in Project…", #selector(searchProject(_:)), "f", target: self, modifiers: [.command, .shift])
         add(edit, "Go to Line…", #selector(goToLine(_:)), "l", target: self, modifiers: [.command, .shift])
         add(edit, "Toggle Line Comment", #selector(toggleComment(_:)), "/", target: self)
@@ -547,6 +633,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
         let build = menu("Build")
         add(build, "Compile PDF", #selector(compile(_:)), "r", target: self)
+        add(build, "Stop Compilation", #selector(stopCompilation(_:)), ".", target: self)
         add(build, "Show Source in PDF", #selector(showSourceInPDF(_:)), "j", target: self, modifiers: [.command, .shift])
         add(build, "Auto Compile", #selector(toggleAutoCompile(_:)), target: self)
         add(build, "Toggle Build Log", #selector(toggleLog(_:)), "l", target: self)

@@ -1,10 +1,32 @@
 import Foundation
 
 struct ProjectHistory {
+    struct EditorPosition: Codable, Equatable {
+        let caretOffset: Int
+        let scrollY: CGFloat
+        let caretWasVisible: Bool?
+        let upstreamAffinity: Bool?
+    }
+
+    struct PDFPosition: Codable, Equatable {
+        let target: URL
+        let viewport: PreviewPDFView.SavedViewport
+    }
+
+    struct WorkspaceState: Codable, Equatable {
+        let layout: WorkspaceLayout
+        let sidebarWidth: CGFloat?
+        let sidebarCollapsed: Bool
+        let editorFraction: CGFloat?
+        let pdf: PDFPosition?
+    }
+
     struct Project: Codable, Equatable {
         let directory: URL
         let activeFile: URL?
         let openFiles: [URL]
+        let editorPositions: [String: EditorPosition]?
+        let workspaceState: WorkspaceState?
     }
 
     private let defaults: UserDefaults
@@ -18,13 +40,16 @@ struct ProjectHistory {
     func recentProjects() -> [Project] {
         guard let data = defaults.data(forKey: key),
               let saved = try? PropertyListDecoder().decode([Project].self, from: data) else { return [] }
-        let projects = saved.compactMap { snapshot(directory: $0.directory, activeFile: $0.activeFile,
-                                                     openFiles: $0.openFiles) }
+        let projects = saved.compactMap {
+            snapshot(directory: $0.directory, activeFile: $0.activeFile, openFiles: $0.openFiles,
+                     editorPositions: $0.editorPositions ?? [:], workspaceState: $0.workspaceState)
+        }
         if saved != projects { save(projects) }
         return projects
     }
 
-    func snapshot(directory: URL, activeFile: URL?, openFiles: [URL]) -> Project? {
+    func snapshot(directory: URL, activeFile: URL?, openFiles: [URL],
+                  editorPositions: [String: EditorPosition] = [:], workspaceState: WorkspaceState? = nil) -> Project? {
         guard directory.isFileURL else { return nil }
         let directory = Self.normalized(directory)
         guard (try? directory.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return nil }
@@ -38,13 +63,22 @@ struct ProjectHistory {
             }
         }
         if let activeFile, paths.insert(activeFile.path).inserted { files.append(activeFile) }
-        return Project(directory: directory, activeFile: activeFile, openFiles: files)
+        let positions = editorPositions.filter { paths.contains($0.key) }
+        return Project(directory: directory, activeFile: activeFile, openFiles: files,
+                       editorPositions: positions.isEmpty ? nil : positions, workspaceState: workspaceState)
     }
 
     func record(_ project: Project) {
         var projects = recentProjects().filter { $0.directory.path != project.directory.path }
         projects.insert(project, at: 0)
         save(Array(projects.prefix(Self.capacity)))
+    }
+
+    func update(_ project: Project) {
+        var projects = recentProjects()
+        guard let index = projects.firstIndex(where: { $0.directory == project.directory }) else { return }
+        projects[index] = project
+        save(projects)
     }
 
     static func normalized(_ url: URL) -> URL {

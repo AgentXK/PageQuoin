@@ -35,7 +35,8 @@ enum AppPalette {
     static let success = adaptive(0x4b6789, 0x9bb2ce)
     static let warning = adaptive(0x896132, 0xc8aa86)
     static let error = adaptive(0x9b504b, 0xd9a19a)
-    static let pdfHighlight = rgb(0xe8c880, opacity: 0.42)
+    static let pdfLightHighlight = (fill: rgb(0x6599db, opacity: 0.36), accent: rgb(0x4379bb, opacity: 1))
+    static let pdfDarkHighlight = (fill: rgb(0x7cabf0, opacity: 0.34), accent: rgb(0x9ac5ff, opacity: 1))
 
     private static func adaptive(_ light: UInt32, _ dark: UInt32, opacity: CGFloat = 1,
                                  highContrast: (UInt32, UInt32)? = nil) -> NSColor {

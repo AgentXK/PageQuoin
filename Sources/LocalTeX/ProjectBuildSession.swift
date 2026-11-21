@@ -6,6 +6,8 @@ final class ProjectBuildSession {
     enum Phase {
         case ready
         case building
+        case stopping
+        case stopped
         case complete
         case outdated
         case failed
@@ -15,11 +17,6 @@ final class ProjectBuildSession {
         let data: Data
         let document: PDFDocument
         let syncTeX: SyncTeXMap?
-    }
-
-    struct ErrorLocation {
-        let file: URL?
-        let line: Int
     }
 
     private static let sessions = NSMapTable<NSString, ProjectBuildSession>(keyOptions: .strongMemory,
@@ -39,16 +36,17 @@ final class ProjectBuildSession {
     private(set) var preview: Preview?
     private(set) var log = "No build log yet."
     private(set) var artifactWarning: String?
-    private(set) var location: ErrorLocation?
+    private(set) var diagnostics: [BuildDiagnostic] = []
     private(set) var automatic = false
+    var isBuilding: Bool { phase == .building || phase == .stopping }
 
-    private init(root: URL?, target: URL?, document: TeXDocument) {
+    private init(root: URL?, target: URL?, untitledDocument: TeXDocument? = nil) {
         self.root = root
         self.target = target
         if let target {
             automatic = UserDefaults.standard.dictionary(forKey: Self.autoKey)?[target.path] as? Bool ?? false
         } else {
-            untitledDocument = document
+            self.untitledDocument = untitledDocument
         }
     }
 
@@ -57,18 +55,18 @@ final class ProjectBuildSession {
         compileTask?.cancel()
     }
 
-    static func shared(root: URL?, target: URL, document: TeXDocument) -> ProjectBuildSession {
+    static func shared(root: URL?, target: URL) -> ProjectBuildSession {
         let root = root.map(normalized)
         let target = normalized(target)
         let key = "\(root?.path ?? "")\u{0}\(target.path)" as NSString
         if let existing = sessions.object(forKey: key) { return existing }
-        let session = ProjectBuildSession(root: root, target: target, document: document)
+        let session = ProjectBuildSession(root: root, target: target)
         sessions.setObject(session, forKey: key)
         return session
     }
 
     static func untitled(document: TeXDocument) -> ProjectBuildSession {
-        ProjectBuildSession(root: nil, target: nil, document: document)
+        ProjectBuildSession(root: nil, target: nil, untitledDocument: document)
     }
 
     static func normalized(_ url: URL) -> URL {
@@ -82,26 +80,63 @@ final class ProjectBuildSession {
 
     static func mainFile(in folder: URL?) -> URL? {
         guard let folder else { return nil }
-        let root = normalized(folder)
-        let saved = UserDefaults.standard.dictionary(forKey: mainKey)?[root.path] as? String
-        for candidate in [saved.map { URL(fileURLWithPath: $0) }, root.appendingPathComponent("main.tex")].compactMap({ $0 }) {
-            let file = normalized(candidate)
-            if contains(file, in: root), ProjectFileKind.detect(for: file) == .latex,
-               (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
-                return file
-            }
-        }
-        return nil
+        return selectedMainFile(in: folder) ?? automaticMainFile(in: folder)
     }
 
-    static func setMainFile(_ file: URL, in folder: URL) {
+    static func selectedMainFile(in folder: URL) -> URL? {
         let root = normalized(folder)
-        let file = normalized(file)
-        guard contains(file, in: root), ProjectFileKind.detect(for: file) == .latex,
-              (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { return }
+        guard let saved = UserDefaults.standard.dictionary(forKey: mainKey)?[root.path] as? String else { return nil }
+        return texFile(URL(fileURLWithPath: saved), in: root)
+    }
+
+    static func automaticMainFile(in folder: URL) -> URL? {
+        let root = normalized(folder)
+        return texFile(root.appendingPathComponent("main.tex"), in: root)
+            ?? topLevelTeXFiles(in: root).first(where: declaresDocumentClass)
+    }
+
+    static func topLevelTeXFiles(in folder: URL) -> [URL] {
+        let root = normalized(folder)
+        let files = try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isRegularFileKey],
+                                                                 options: .skipsHiddenFiles)
+        let sources = Set((files ?? []).compactMap { texFile($0, in: root) })
+        return sources.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+    }
+
+    @discardableResult
+    static func setMainFile(_ file: URL?, in folder: URL) -> Bool {
+        let root = normalized(folder)
+        let selected = file.flatMap { texFile($0, in: root) }
+        guard file == nil || selected != nil else { return false }
         var settings = UserDefaults.standard.dictionary(forKey: mainKey) ?? [:]
-        settings[root.path] = file.path
+        settings[root.path] = selected?.path
         UserDefaults.standard.set(settings, forKey: mainKey)
+        return true
+    }
+
+    private static func texFile(_ url: URL, in root: URL) -> URL? {
+        guard ProjectFileKind.detect(for: url) == .latex else { return nil }
+        let file = normalized(url)
+        guard contains(file, in: root), ProjectFileKind.detect(for: file) == .latex,
+              (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { return nil }
+        return file
+    }
+
+    private static func declaresDocumentClass(_ file: URL) -> Bool {
+        guard let input = try? FileHandle(forReadingFrom: file) else { return false }
+        defer { try? input.close() }
+        // The declaration normally appears at the top. Bound I/O when auto-detecting large projects.
+        guard let data = try? input.read(upToCount: 64 * 1024) else { return false }
+        let source = ProjectTextEncoding.decode(data)?.text ?? String(decoding: data, as: UTF8.self)
+        var scanner = TeXScanner(source)
+        while let command = scanner.nextCommand() {
+            if command == "documentclass" { return true }
+            if command == "begin" {
+                scanner.skipTrivia()
+                if let range = scanner.readGroup(), scanner.source.substring(with: range) == "document" { return false }
+            }
+        }
+        return false
     }
 
     static func openSources(in folder: URL, editedOnly: Bool = false) -> [URL: String] {
@@ -124,6 +159,13 @@ final class ProjectBuildSession {
             if session !== primary, let root = session.root, contains(file, in: root) {
                 session.sourceDidChange()
             }
+        }
+    }
+
+    static func sourcesDidChange(in folder: URL) {
+        let root = normalized(folder)
+        for case let session as ProjectBuildSession in sessions.objectEnumerator()?.allObjects ?? [] {
+            if session.root == root { session.sourceDidChange() }
         }
     }
 
@@ -182,6 +224,17 @@ final class ProjectBuildSession {
         }
     }
 
+    func stopCompilation() {
+        guard phase == .building, let compileTask else { return }
+        automaticTask?.cancel()
+        automaticTask = nil
+        compileAgain = false
+        phase = .stopping
+        log = "Stopping Tectonic…"
+        compileTask.cancel()
+        publish()
+    }
+
     func compile() {
         guard compileTask == nil else { return }
         automaticTask?.cancel()
@@ -198,7 +251,7 @@ final class ProjectBuildSession {
             .map { URL(fileURLWithPath: $0) }
         let startRevision = revision
         phase = .building
-        location = nil
+        diagnostics = []
         artifactWarning = nil
         log = "Running Tectonic…"
         compileTask = Task { [weak self] in
@@ -216,23 +269,31 @@ final class ProjectBuildSession {
                 } else {
                     throw CocoaError(.fileNoSuchFile)
                 }
+                try Task.checkCancellation()
                 let result = try await TectonicCompiler.compile(source: buffer, fileURL: target, engineURL: engine,
                                                                projectRoot: root, unsavedSources: unsavedSources)
                 try Task.checkCancellation()
                 self?.finish(result, revision: startRevision)
-            } catch is CancellationError {
-                return
             } catch {
-                self?.fail(error)
+                if Task.isCancelled || error is CancellationError { self?.finishStoppedBuild() }
+                else { self?.fail(error) }
             }
         }
         publish()
     }
 
+    private func finishStoppedBuild() {
+        phase = .stopped
+        log = "Compilation stopped."
+        finishBuild()
+    }
+
     private func finish(_ result: CompilationResult, revision builtRevision: Int) {
         artifactWarning = result.artifactWarning
+        diagnostics = result.diagnostics
         guard let document = PDFDocument(data: result.pdfData), document.pageCount > 0 else {
             phase = .failed
+            diagnostics.insert(BuildDiagnostic(severity: .error, message: "Could not open the PDF generated by Tectonic."), at: 0)
             log = "Could not open the PDF generated by Tectonic.\n\n" + result.log
             finishBuild()
             return
@@ -245,10 +306,14 @@ final class ProjectBuildSession {
     }
 
     private func fail(_ error: Error) {
-        let detail = (error as? TectonicError)?.log ?? ""
+        let tectonic = error as? TectonicError
+        let detail = tectonic?.log ?? ""
+        diagnostics = tectonic?.diagnostics ?? []
+        if !diagnostics.contains(where: { $0.severity == .error }) {
+            diagnostics.insert(BuildDiagnostic(severity: .error, message: error.localizedDescription), at: 0)
+        }
         log = detail.isEmpty ? error.localizedDescription : "\(error.localizedDescription)\n\n\(detail)"
         phase = .failed
-        location = sourceLocation(in: detail)
         finishBuild()
     }
 
@@ -262,22 +327,4 @@ final class ProjectBuildSession {
         for workspace in workspaces.allObjects { workspace.buildDidChange(self) }
     }
 
-    private func sourceLocation(in log: String) -> ErrorLocation? {
-        for message in log.split(whereSeparator: \.isNewline) {
-            guard let match = message.wholeMatch(of: #/\s*error:\s+(.+?):([0-9]+):\s+.*/#),
-                  let line = Int(match.2), line > 0 else {
-                continue
-            }
-            let name = String(match.1)
-            if name == "texput" || name == "texput.tex" { return ErrorLocation(file: target, line: line) }
-            guard let directory = target?.deletingLastPathComponent(), let root else { continue }
-            let path = URL(fileURLWithPath: name, relativeTo: directory)
-            let file = Self.normalized(path.pathExtension.isEmpty ? path.appendingPathExtension("tex") : path)
-            if Self.contains(file, in: root), ProjectFileKind.detect(for: file)?.isEditable == true,
-               (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
-                return ErrorLocation(file: file, line: line)
-            }
-        }
-        return nil
-    }
 }

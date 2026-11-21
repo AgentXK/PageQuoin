@@ -5,8 +5,10 @@ import PDFKit
 @MainActor
 final class OpenedMediaController: NSViewController {
     private let kind: ProjectFileKind
-    private let data: Data
+    private var data: Data
     private let name: String
+    private weak var currentImageView: NSImageView?
+    private weak var currentPDFView: PreviewPDFView?
 
     init(kind: ProjectFileKind, data: Data, name: String) {
         self.kind = kind
@@ -16,6 +18,12 @@ final class OpenedMediaController: NSViewController {
     }
 
     required init?(coder: NSCoder) { nil }
+
+    func replaceData(_ data: Data) {
+        self.data = data
+        if let currentImageView { currentImageView.image = NSImage(data: data) ?? decodedImage() }
+        if let currentPDFView { currentPDFView.replaceDocument(PDFDocument(data: data)) }
+    }
 
     override func loadView() {
         switch kind {
@@ -27,6 +35,7 @@ final class OpenedMediaController: NSViewController {
 
     private func makeImageView() -> NSView {
         let imageView = FittedImageView()
+        currentImageView = imageView
         imageView.image = NSImage(data: data) ?? decodedImage()
         imageView.imageScaling = .scaleProportionallyDown
         imageView.animates = true
@@ -52,6 +61,7 @@ final class OpenedMediaController: NSViewController {
 
     private func makePDFView() -> NSView {
         let pdf = PreviewPDFView()
+        currentPDFView = pdf
         pdf.displayMode = .singlePageContinuous
         pdf.backgroundColor = AppPalette.preview
         pdf.minScaleFactor = 0.15

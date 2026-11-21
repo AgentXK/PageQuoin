@@ -2,7 +2,7 @@ import AppKit
 import PDFKit
 import UniformTypeIdentifiers
 
-enum WorkspaceLayout {
+enum WorkspaceLayout: String, Codable {
     case split
     case editorOnly
     case pdfOnly
@@ -10,14 +10,27 @@ enum WorkspaceLayout {
 
 @MainActor
 final class WorkspaceController: NSViewController {
+    private static let pdfDarkAppearanceKey = "PDFPreviewDarkAppearance"
+    private static let pdfAppearanceDidChange = Notification.Name("LocalTeXPDFPreviewAppearanceChanged")
+
     struct SidebarLayout {
         var width: CGFloat?
         var isCollapsed: Bool
     }
 
+    struct TabPreview {
+        let session: ProjectBuildSession
+        let viewport: PreviewPDFView.TabViewport
+        let searchQuery: String?
+        let showsLog: Bool
+    }
+
     private weak var document: TeXDocument?
     private let emptyTabs: DocumentTabGroup?
     private let editor = SourceEditorController()
+    private weak var openedMedia: OpenedMediaController?
+    private var detachedEditorPosition: ProjectHistory.EditorPosition?
+    private var detachedPreview: TabPreview?
     private let fileTree = FileTreeController()
     private let outline = TexOutlineController()
     private let tabStrip = FileTabStrip()
@@ -34,6 +47,7 @@ final class WorkspaceController: NSViewController {
         target: self, action: #selector(toggleLog(_:)))
     private let pdfView = PreviewPDFView()
     private lazy var pdfPageNavigator = PDFPageNavigator(pdfView: pdfView)
+    private lazy var pdfSearchBar = PDFSearchBar(pdfView: pdfView)
     private let previewPlaceholder = NSView()
     private let compileButton = PreviewCompileButton()
     private lazy var sourceJumpButton = WorkspaceToolbarButton(symbol: "arrow.right", restingBackground: true,
@@ -44,9 +58,12 @@ final class WorkspaceController: NSViewController {
     private let zoomInButton = NSButton()
     private let zoomOutButton = NSButton()
     private let fitButton = NSButton()
+    private let pdfAppearanceButton = NSButton()
     private let logView = NSTextView()
     private let logPanel = NSView()
-    private let errorButton = NSButton()
+    private let rawLogScroll = NSScrollView()
+    private let buildProblems = BuildProblemsView()
+    private let logModeControl = NSSegmentedControl()
     private let statusImage = NSImageView()
     private let statusLabel = NSTextField(labelWithString: "")
     private var logHeight: NSLayoutConstraint?
@@ -56,15 +73,18 @@ final class WorkspaceController: NSViewController {
     private var buildSession: ProjectBuildSession?
     private var projectSearch: ProjectSearchController?
     private var autosaveWarning: String?
+    private var externalFileNotice: String?
     private var isCreatingProjectEntry = false
+    private var isImportingImages = false
     private var isCleaningBuildFiles = false
 
     private(set) var workspaceLayout: WorkspaceLayout = .split
     var hasBuildTarget: Bool { buildSession != nil }
-    var canCompile: Bool { hasBuildTarget && buildSession?.phase != .building }
+    var canCompile: Bool { buildSession?.isBuilding == false }
+    var canStopCompilation: Bool { buildSession?.phase == .building }
     var canShowSourceInPDF: Bool { sourcePreviewLocation() != nil }
     var canCleanBuildFiles: Bool {
-        !isCleaningBuildFiles && (buildFilesDirectory != nil || (projectDirectory != nil && buildSession?.phase == .building))
+        !isCleaningBuildFiles && (buildFilesDirectory != nil || (projectDirectory != nil && buildSession?.isBuilding == true))
     }
     var buildFilesDirectory: URL? {
         projectDirectory.flatMap(TectonicCompiler.buildArtifactDirectory(in:))
@@ -76,6 +96,7 @@ final class WorkspaceController: NSViewController {
     var isAutoCompiling: Bool { buildSession?.automatic == true }
     var canSearchProject: Bool { fileTreeRoot != nil }
     var projectDirectory: URL? { fileTreeRoot }
+    private(set) var projectMainDocument: URL?
     var documentURL: URL? { document?.fileURL }
     var documentTabs: DocumentTabGroup? { document?.tabs ?? emptyTabs }
     var projectTabDocumentURLs: [URL] { documentTabs?.documents.compactMap(\.fileURL) ?? [] }
@@ -152,24 +173,27 @@ final class WorkspaceController: NSViewController {
         ])
 
         editor.source = document?.source ?? ""
-        outline.update(source: canUseLaTeXCommands ? editor.source : "")
+        editor.documentUndoManager = document?.undoManager
         editor.onChange = { [weak self] source in
             guard let self else { return }
             document?.source = source
-            if canUseLaTeXCommands { outline.update(source: source) }
+            refreshProjectOutline()
             ProjectBuildSession.sourceDidChange(in: document, primary: buildSession)
         }
-        outline.onNavigate = { [weak self] range in
-            guard let self else { return }
-            revealEditorIfNeeded()
-            editor.reveal(range)
+        editor.onImageDrop = { [weak self] files, offset in self?.importImages(files, at: offset) ?? false }
+        outline.onNavigate = { [weak self] heading in self?.revealOutlineHeading(heading) }
+        editor.referenceCandidates = { [weak self] kind, query in
+            guard let input = self?.referenceInput() else { return [] }
+            return await ProjectReferenceIndex.shared.candidates(for: kind, matching: query, in: input)
         }
+        editor.onLabelDefinition = { [weak self] label in self?.openLabelDefinition(label) }
         tabStrip.onSelect = { [weak self] id in self?.documentTabs?.select(id) }
         tabStrip.onClose = { [weak self] id in self?.documentTabs?.close(id) }
         fileTree.onChooseRoot = { [weak self] in self?.chooseProjectFolder() }
         fileTree.onCreateEntry = { [weak self] kind, directory in self?.createProjectEntry(kind, in: directory) }
         fileTree.onOpenFile = { [weak self] url in self?.openProjectFile(url) }
         fileTree.onSetMainFile = { [weak self] url in self?.setMainFile(url) }
+        fileTree.onRefresh = { [weak self] in self?.bindBuildSession() }
         fileURLObservation = document?.observe(\.fileURL, options: [.old]) { [weak self] _, change in
             let previousURL = change.oldValue ?? nil
             Task { @MainActor in self?.documentLocationChanged(from: previousURL) }
@@ -178,10 +202,25 @@ final class WorkspaceController: NSViewController {
             NotificationCenter.default.addObserver(self, selector: #selector(previewChanged(_:)),
                                                    name: notification, object: pdfView)
         }
+        NotificationCenter.default.addObserver(self, selector: #selector(updatePDFAppearance(_:)),
+                                               name: Self.pdfAppearanceDidChange, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(refreshOutlineOnActivation(_:)),
+                                               name: NSApplication.didBecomeActiveNotification, object: NSApp)
+        updatePDFAppearance()
         updateFileTree()
         bindBuildSession()
         updatePreviewControls()
         if !hasBuildTarget { updateStandaloneStatus() }
+    }
+
+    override func viewWillAppear() {
+        super.viewWillAppear()
+        refreshProjectOutline()
+    }
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        document?.checkForExternalFileChanges()
     }
 
     private func makeMainPane() -> NSViewController {
@@ -190,9 +229,9 @@ final class WorkspaceController: NSViewController {
         controller.view = container
         let sourcePane = makePane(header: tabStrip, content: makeEditorContent())
         compileButton.target = self
-        compileButton.action = #selector(compile(_:))
+        compileButton.action = #selector(performPreviewBuildAction(_:))
         let previewHeader = PDFPreviewHeader(compileButton: compileButton, navigator: pdfPageNavigator,
-                                            zoomControls: makeZoomControls(), zoomLabel: zoomLabel)
+                                            trailingControls: makePreviewControls(), zoomLabel: zoomLabel)
         let previewPane = makePane(header: previewHeader, content: makePreview())
         for pane in [sourcePane, previewPane] {
             let item = NSSplitViewItem(viewController: pane)
@@ -241,12 +280,9 @@ final class WorkspaceController: NSViewController {
         _ = view
         let sourceItem = columns.splitViewItems[0]
         let previewItem = columns.splitViewItems[1]
-        let divider = columns.splitView
+        let viewport = layout == .editorOnly || workspaceLayout == .editorOnly ? pdfView.captureTabViewport() : nil
         if workspaceLayout == .split {
-            view.layoutSubtreeIfNeeded()
-            let width = divider.bounds.width - divider.dividerThickness
-            let editorWidth = sourceItem.viewController.view.frame.width
-            if width > 0, editorWidth > 0 { splitEditorFraction = editorWidth / width }
+            splitEditorFraction = editorSplitFraction
         }
         if layout == .pdfOnly, let window = view.window, let focusedView = window.firstResponder as? NSView,
            focusedView.isDescendant(of: sourceItem.viewController.view) {
@@ -261,13 +297,7 @@ final class WorkspaceController: NSViewController {
             sourceItem.isCollapsed = false
             previewItem.isCollapsed = false
             sourceJumpDividerConstraint?.isActive = true
-            if let splitEditorFraction {
-                view.layoutSubtreeIfNeeded()
-                let desired = splitEditorFraction * (divider.bounds.width - divider.dividerThickness)
-                let minimum = divider.minPossiblePositionOfDivider(at: 0)
-                let maximum = divider.maxPossiblePositionOfDivider(at: 0)
-                divider.setPosition(min(maximum, max(minimum, desired)), ofDividerAt: 0)
-            }
+            restoreEditorSplitFraction(splitEditorFraction)
         case .editorOnly:
             sourceItem.isCollapsed = false
             previewItem.isCollapsed = true
@@ -276,7 +306,29 @@ final class WorkspaceController: NSViewController {
             previewItem.isCollapsed = false
             sourceItem.isCollapsed = true
         }
+        if let viewport { pdfView.restoreTabViewport(viewport) }
         updateSourceJumpButton()
+    }
+
+    var editorSplitFraction: CGFloat? {
+        guard isViewLoaded, workspaceLayout == .split else { return splitEditorFraction }
+        view.layoutSubtreeIfNeeded()
+        let divider = columns.splitView
+        let width = divider.bounds.width - divider.dividerThickness
+        let editorWidth = columns.splitViewItems[0].viewController.view.frame.width
+        return width > 0 && editorWidth > 0 ? editorWidth / width : splitEditorFraction
+    }
+
+    func restoreEditorSplitFraction(_ fraction: CGFloat?) {
+        guard let fraction else { return }
+        splitEditorFraction = fraction
+        guard workspaceLayout == .split else { return }
+        view.layoutSubtreeIfNeeded()
+        let divider = columns.splitView
+        let desired = fraction * (divider.bounds.width - divider.dividerThickness)
+        let minimum = divider.minPossiblePositionOfDivider(at: 0)
+        let maximum = divider.maxPossiblePositionOfDivider(at: 0)
+        divider.setPosition(min(maximum, max(minimum, desired)), ofDividerAt: 0)
     }
 
     private func revealEditorIfNeeded() {
@@ -286,7 +338,9 @@ final class WorkspaceController: NSViewController {
     private func makeEditorContent() -> NSViewController {
         guard let document else { return makeEmptyEditor() }
         guard let data = document.mediaData else { return editor }
-        return OpenedMediaController(kind: document.kind, data: data, name: document.displayName)
+        let media = OpenedMediaController(kind: document.kind, data: data, name: document.displayName)
+        openedMedia = media
+        return media
     }
 
     private func makeEmptyEditor() -> NSViewController {
@@ -471,6 +525,60 @@ final class WorkspaceController: NSViewController {
         }
     }
 
+    private var imageWorkingDirectory: URL? {
+        (buildSession?.target ?? projectMainDocument ?? documentURL)?.deletingLastPathComponent() ?? fileTreeRoot
+    }
+
+    private func importImages(_ files: [URL], at offset: Int) -> Bool {
+        guard canUseLaTeXCommands, let document, let window = view.window,
+              window.attachedSheet == nil, !isImportingImages else { return false }
+        guard let root = fileTreeRoot.map(ProjectBuildSession.normalized),
+              let workingDirectory = imageWorkingDirectory.map(ProjectBuildSession.normalized) else {
+            showImageImportMessage("Choose a Project Folder First", message: "Save this document or choose a project folder to import figures.",
+                                   in: window)
+            return false
+        }
+        let original = editor.source
+        isImportingImages = true
+        Task { [weak self, weak document, weak window] in
+            defer { self?.isImportingImages = false }
+            let result = await Task.detached(priority: .userInitiated) {
+                ProjectImageImport.add(files, to: root, relativeTo: workingDirectory)
+            }.value
+            guard let self else { return }
+            for workspace in tabWorkspaces where workspace.isViewLoaded
+                && workspace.fileTreeRoot.map(ProjectBuildSession.normalized) == root {
+                workspace.fileTree.reload()
+            }
+
+            var feedback = result.failures.prefix(4).joined(separator: "\n")
+            if result.failures.count > 4 { feedback += "\n\(result.failures.count - 4) more files." }
+            if !result.paths.isEmpty {
+                let isSameDocument = document != nil && self.document === document && document?.workspace === self
+                let isSameProject = fileTreeRoot.map(ProjectBuildSession.normalized) == root
+                    && imageWorkingDirectory.map(ProjectBuildSession.normalized) == workingDirectory
+                if !isSameDocument || !isSameProject
+                    || !editor.insertImagePaths(result.paths, at: offset, expectedSource: original) {
+                    if !feedback.isEmpty { feedback += "\n\n" }
+                    feedback += "The figures are available in the project. Drag them into the editor again to insert their paths."
+                }
+            }
+            if !feedback.isEmpty, let window,
+               (window.contentViewController as? WorkspaceController)?.projectDirectory.map(ProjectBuildSession.normalized) == root {
+                showImageImportMessage("Image Drop Was Incomplete", message: feedback, in: window)
+            }
+        }
+        return true
+    }
+
+    private func showImageImportMessage(_ title: String, message: String, in window: NSWindow) {
+        guard window.attachedSheet == nil else { return }
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.beginSheetModal(for: window, completionHandler: nil)
+    }
+
     func openProjectFile(_ url: URL, onOpened: ((WorkspaceController) -> Void)? = nil,
                          onFailure: (() -> Void)? = nil) {
         guard let tabs = documentTabs else { onFailure?(); return }
@@ -497,6 +605,33 @@ final class WorkspaceController: NSViewController {
         }
     }
 
+    private func referenceInput() -> ProjectReferenceIndex.Input {
+        let root = fileTreeRoot.map(ProjectBuildSession.normalized)
+        let file = documentURL.map(ProjectBuildSession.normalized)
+        var openSources = root.map { ProjectBuildSession.openSources(in: $0) } ?? [:]
+        if let file { openSources[file] = editor.source }
+        return ProjectReferenceIndex.Input(root: root, openSources: openSources,
+                                           untitledSource: file == nil ? editor.source : nil, currentFile: file)
+    }
+
+    private func openLabelDefinition(_ label: String) {
+        let input = referenceInput()
+        Task { [weak self] in
+            let definition = await ProjectReferenceIndex.shared.definition(of: label, in: input)
+            guard let self, let window = view.window, window.contentViewController === self else { return }
+            guard let definition else { NSSound.beep(); return }
+            if let file = definition.file, file != input.currentFile {
+                openProjectFile(file) { workspace in
+                    workspace.revealEditorIfNeeded()
+                    workspace.editor.reveal(definition.range)
+                }
+            } else {
+                revealEditorIfNeeded()
+                editor.reveal(definition.range)
+            }
+        }
+    }
+
     func activateProjectTab() { document?.showWindows() }
 
     func updateFileTabs(_ tabs: [FileTabStrip.Tab], selected: ObjectIdentifier?) {
@@ -507,6 +642,91 @@ final class WorkspaceController: NSViewController {
         if canEditSource && workspaceLayout != .pdfOnly { editor.focusEditor() }
     }
 
+    var editorPosition: ProjectHistory.EditorPosition? {
+        canEditSource ? detachedEditorPosition ?? editor.editorPosition : nil
+    }
+
+    func restoreEditorPosition(_ position: ProjectHistory.EditorPosition) {
+        if canEditSource { editor.restoreEditorPosition(position) }
+    }
+
+    func reloadExternalSource() {
+        guard let document else { return }
+        if isViewLoaded {
+            if document.kind.isEditable {
+                let position = editorPosition
+                editor.source = document.source
+                if let position { editor.restoreEditorPosition(position) }
+                refreshProjectOutline()
+            } else if let data = document.mediaData {
+                openedMedia?.replaceData(data)
+            }
+        }
+        ProjectBuildSession.sourceDidChange(in: document, primary: buildSession)
+    }
+
+    func rememberEditorPositionBeforeTabSwitch() {
+        // AppKit can resize and scroll a text view when its workspace leaves the window.
+        detachedEditorPosition = editorPosition
+    }
+
+    func restoreEditorPositionAfterTabSwitch() {
+        guard let position = detachedEditorPosition else { return }
+        detachedEditorPosition = nil
+        if canEditSource { editor.restoreEditorScroll(position) }
+    }
+
+    func rememberPreviewBeforeTabSwitch() -> TabPreview? {
+        if let buildSession, let viewport = pdfView.captureTabViewport() {
+            detachedPreview = TabPreview(session: buildSession, viewport: viewport,
+                                         searchQuery: pdfSearchBar.visibleQuery, showsLog: !logPanel.isHidden)
+        } else {
+            detachedPreview = nil
+        }
+        return detachedPreview
+    }
+
+    func restorePreviewAfterTabSwitch(_ previous: TabPreview?) {
+        let preview = previous?.session === buildSession ? previous : detachedPreview
+        detachedPreview = nil
+        guard let preview, preview.session === buildSession else { return }
+        pdfSearchBar.restoreVisibleQuery(preview.searchQuery)
+        setLogVisible(preview.showsLog)
+        view.layoutSubtreeIfNeeded()
+        pdfView.restoreTabViewport(preview.viewport)
+        updatePreviewControls()
+    }
+
+    var projectWorkspaceState: ProjectHistory.WorkspaceState {
+        let sidebar = sidebarLayout
+        let savedPDF: ProjectHistory.PDFPosition?
+        if let target = buildSession?.target, let viewport = pdfView.captureSavedViewport() {
+            savedPDF = .init(target: target, viewport: viewport)
+        } else {
+            savedPDF = documentTabs?.pendingProjectPDF
+        }
+        return .init(layout: workspaceLayout, sidebarWidth: sidebar.width, sidebarCollapsed: sidebar.isCollapsed,
+                     editorFraction: editorSplitFraction, pdf: savedPDF)
+    }
+
+    func restoreProjectWorkspace(_ state: ProjectHistory.WorkspaceState) {
+        restoreSidebar(SidebarLayout(width: state.sidebarWidth.flatMap { $0.isFinite && $0 > 0 ? $0 : nil },
+                                     isCollapsed: state.sidebarCollapsed))
+        setWorkspaceLayout(state.layout)
+        restoreEditorSplitFraction(state.editorFraction.flatMap { $0.isFinite && (0...1).contains($0) ? $0 : nil })
+        documentTabs?.pendingProjectPDF = state.pdf
+        restoreProjectPDFIfReady()
+    }
+
+    func restoreProjectPDFIfReady() {
+        guard let tabs = documentTabs, let saved = tabs.pendingProjectPDF,
+              buildSession?.target == saved.target, pdfView.document != nil,
+              view.window?.contentViewController === self else { return }
+        tabs.pendingProjectPDF = nil
+        view.layoutSubtreeIfNeeded()
+        pdfView.restoreSavedViewport(saved.viewport)
+    }
+
     func endTypingGroup() {
         if canEditSource { editor.endTypingGroup() }
     }
@@ -514,6 +734,22 @@ final class WorkspaceController: NSViewController {
     @objc func compile(_ sender: Any?) {
         bindBuildSession()
         buildSession?.compile()
+    }
+
+    @objc private func performPreviewBuildAction(_ sender: Any?) {
+        if canStopCompilation { stopCompilation() }
+        else { compile(sender) }
+    }
+
+    func stopCompilation() {
+        buildSession?.stopCompilation()
+    }
+
+    func compileAtStartup() {
+        bindBuildSession()
+        guard let main = projectMainDocument, let buildSession, buildSession.target == main,
+              buildSession.phase == .ready else { return }
+        buildSession.compile()
     }
 
     private func sourcePreviewLocation() -> (ProjectBuildSession, SyncTeXMap.PDFLocation)? {
@@ -544,7 +780,7 @@ final class WorkspaceController: NSViewController {
             workspace.attachBuildSession(session)
             if workspace.pdfView.document === preview.document {
                 let rect = CGRect(origin: point, size: CGSize(width: 1, height: 1))
-                _ = workspace.pdfView.revealSourceLocation(pageIndex: pageIndex, rect: rect)
+                _ = workspace.pdfView.revealSourceLocation(pageIndex: pageIndex, rect: rect, highlightLine: false)
             }
         }
     }
@@ -580,14 +816,14 @@ final class WorkspaceController: NSViewController {
     }
 
     private func bindBuildSession() {
-        guard let document else { return }
         let folder = fileTreeRoot
-        let main = ProjectBuildSession.mainFile(in: folder)
-        fileTree.setMainFile(main)
+        projectMainDocument = ProjectBuildSession.mainFile(in: folder)
+        fileTree.setMainFile(projectMainDocument)
+        refreshProjectOutline()
         let session: ProjectBuildSession
-        if let target = main ?? compilationSource(for: document, in: folder) {
-            session = ProjectBuildSession.shared(root: folder, target: target, document: document)
-        } else if document.kind == .latex && document.fileURL == nil {
+        if let target = projectMainDocument ?? document.flatMap({ compilationSource(for: $0, in: folder) }) {
+            session = ProjectBuildSession.shared(root: folder, target: target)
+        } else if let document, document.kind == .latex && document.fileURL == nil {
             if let buildSession, buildSession.target == nil { return }
             session = ProjectBuildSession.untitled(document: document)
         } else {
@@ -596,8 +832,8 @@ final class WorkspaceController: NSViewController {
                 self.buildSession = nil
                 display(nil)
                 showLog("No build log yet.")
+                updateBuildProblems(nil)
                 setLogVisible(false)
-                errorButton.isHidden = true
                 updatePreviewControls()
             }
             updateStandaloneStatus()
@@ -610,6 +846,8 @@ final class WorkspaceController: NSViewController {
     private func attachBuildSession(_ session: ProjectBuildSession) {
         guard buildSession !== session else { return }
         buildSession?.detach(self)
+        detachedPreview = nil
+        pdfView.discardPendingTabViewport()
         buildSession = session
         session.attach(self)
     }
@@ -624,15 +862,63 @@ final class WorkspaceController: NSViewController {
         }.first
     }
 
-    private func setMainFile(_ url: URL) {
-        guard let folder = fileTreeRoot else { return }
-        ProjectBuildSession.setMainFile(url, in: folder)
+    private func refreshProjectOutline() {
+        guard isViewLoaded else { return }
+        outline.update { [weak self] in self?.projectOutlineSource() }
+    }
+
+    @objc private func refreshOutlineOnActivation(_ notification: Notification) {
+        if isViewLoaded, view.window?.isMainWindow == true { refreshProjectOutline() }
+    }
+
+    private func projectOutlineSource() -> ProjectOutline {
+        let source = canUseLaTeXCommands ? editor.source : ""
+        let fallback = ProjectOutline.document(source: source, file: documentURL.map(ProjectBuildSession.normalized))
+        guard let folder = fileTreeRoot else { return fallback }
+        let root = ProjectBuildSession.normalized(folder)
+        let target = projectMainDocument ?? openOutlineMainFile(in: root)
+            ?? document.flatMap { compilationSource(for: $0, in: root) }
+        guard let target, ProjectBuildSession.contains(ProjectBuildSession.normalized(target), in: root) else { return fallback }
+        return .project(main: target, root: root, openSources: ProjectBuildSession.openSources(in: root))
+    }
+
+    private func openOutlineMainFile(in root: URL) -> URL? {
+        // An open full document remains the outline root when a referenced fragment becomes active.
+        let documents = [document].compactMap { $0 } + (documentTabs?.documents ?? [])
+        return documents.lazy.compactMap { document -> URL? in
+            guard document.kind == .latex, let url = document.fileURL,
+                  document.source.contains("\\documentclass") else { return nil }
+            let file = ProjectBuildSession.normalized(url)
+            return ProjectBuildSession.contains(file, in: root) ? file : nil
+        }.first
+    }
+
+    private func revealOutlineHeading(_ heading: TeXOutlineHeading) {
+        if let file = heading.file, documentURL.map(ProjectBuildSession.normalized) != file {
+            guard let root = fileTreeRoot.map(ProjectBuildSession.normalized),
+                  ProjectBuildSession.contains(file, in: root) else { return }
+            openProjectFile(file) { workspace in
+                workspace.revealEditorIfNeeded()
+                workspace.editor.reveal(heading.range)
+            }
+        } else {
+            revealEditorIfNeeded()
+            editor.reveal(heading.range)
+        }
+    }
+
+    @discardableResult
+    private func setMainFile(_ url: URL?) -> Bool {
+        guard let folder = fileTreeRoot, ProjectBuildSession.setMainFile(url, in: folder) else { return false }
+        bindBuildSession()
         let root = ProjectBuildSession.normalized(folder)
         for case let document as TeXDocument in NSDocumentController.shared.documents {
-            if let workspace = document.workspace, workspace.fileTreeRoot.map(ProjectBuildSession.normalized) == root {
+            if let workspace = document.workspace, workspace !== self,
+               workspace.fileTreeRoot.map(ProjectBuildSession.normalized) == root {
                 workspace.bindBuildSession()
             }
         }
+        return true
     }
 
     func closeWorkspace() {
@@ -642,6 +928,12 @@ final class WorkspaceController: NSViewController {
         }
         buildSession?.detach(self)
         buildSession = nil
+    }
+
+    func applyProjectReplacement(_ file: ProjectReplacementFile, replacement: String) -> Bool {
+        guard let document, canEditSource else { return false }
+        _ = view
+        return editor.applyProjectReplacement(ranges: file.ranges, replacement: replacement, expected: document.source)
     }
 
     @objc func showProjectSearch(_ sender: Any? = nil) {
@@ -700,7 +992,7 @@ final class WorkspaceController: NSViewController {
         panel.title = "Export PDF"
         panel.allowedContentTypes = [.pdf]
         panel.canCreateDirectories = true
-        let target = ProjectBuildSession.mainFile(in: fileTreeRoot) ?? document?.fileURL
+        let target = projectMainDocument ?? document?.fileURL
         let name = target?.deletingPathExtension().lastPathComponent ?? "Untitled"
         panel.nameFieldStringValue = name + ".pdf"
         panel.directoryURL = target?.deletingLastPathComponent()
@@ -737,10 +1029,30 @@ final class WorkspaceController: NSViewController {
         updatePreviewControls()
     }
 
+    var canSearchPDF: Bool { pdfView.document != nil }
+
+    var hasPDFFindFocus: Bool {
+        guard canSearchPDF, !pdfView.isHiddenOrHasHiddenAncestor, let window = pdfView.window,
+              window === NSApp.keyWindow else { return false }
+        if workspaceLayout == .pdfOnly || pdfSearchBar.hasFocus { return true }
+        return (window.firstResponder as? NSView)?.isDescendant(of: pdfView) == true
+    }
+
+    func findInPDF(_ action: NSTextFinder.Action = .showFindInterface) {
+        guard canSearchPDF else { return }
+        if workspaceLayout == .editorOnly { setWorkspaceLayout(.split) }
+        switch action {
+        case .nextMatch: pdfSearchBar.move(1)
+        case .previousMatch: pdfSearchBar.move(-1)
+        default: pdfSearchBar.show()
+        }
+    }
+
     func buildDidChange(_ session: ProjectBuildSession) {
         guard buildSession === session else { return }
         if pdfView.document !== session.preview?.document {
-            display(session.preview?.document)
+            display(session.preview)
+            restoreProjectPDFIfReady()
             for workspace in tabWorkspaces where workspace !== self && workspace.isViewLoaded {
                 workspace.updateSourceJumpButton()
             }
@@ -749,29 +1061,16 @@ final class WorkspaceController: NSViewController {
             showLog(session.log)
             if session.phase == .failed { setLogVisible(true) }
         }
-        errorButton.isHidden = session.location == nil
+        updateBuildProblems(session)
         updateStatus(session)
         updatePreviewControls()
         updateToolbar()
     }
 
-    private func display(_ pdf: PDFDocument?) {
-        let previousPage = pdfView.currentPage.flatMap { pdfView.document?.index(for: $0) } ?? 0
-        let fitted = pdfView.document == nil || pdfView.autoScales
-        let scale = pdfView.scaleFactor
-        pdfView.clearSourceHighlight()
-        pdfView.document = pdf
-        pdfView.isHidden = pdf == nil
-        previewPlaceholder.isHidden = pdf != nil
-        guard let pdf, pdf.pageCount > 0 else { return }
-        if fitted {
-            pdfView.autoScales = true
-        } else {
-            pdfView.scaleFactor = scale
-        }
-        if let page = pdf.page(at: min(previousPage, pdf.pageCount - 1)) {
-            pdfView.go(to: page)
-        }
+    private func display(_ preview: ProjectBuildSession.Preview?) {
+        pdfView.replaceDocument(preview?.document)
+        previewPlaceholder.isHidden = preview != nil
+        pdfSearchBar.setPreviewData(preview?.data)
     }
 
     @objc private func previewChanged(_ notification: Notification) {
@@ -797,8 +1096,17 @@ final class WorkspaceController: NSViewController {
         else { updateStandaloneStatus() }
     }
 
+    func setExternalFileNotice(_ notice: String?) {
+        guard externalFileNotice != notice else { return }
+        externalFileNotice = notice
+        if let buildSession { updateStatus(buildSession) }
+        else { updateStandaloneStatus() }
+    }
+
     private func updateStandaloneStatus() {
-        if autosaveWarning != nil {
+        if let externalFileNotice {
+            statusLabel.stringValue = externalFileNotice
+        } else if autosaveWarning != nil {
             statusLabel.stringValue = "Autosave failed"
         } else {
             switch document?.kind {
@@ -807,10 +1115,11 @@ final class WorkspaceController: NSViewController {
             default: statusLabel.stringValue = "Ready"
             }
         }
-        statusLabel.toolTip = autosaveWarning
-        let symbol = autosaveWarning == nil ? "circle" : "exclamationmark.circle.fill"
+        statusLabel.toolTip = externalFileNotice ?? autosaveWarning
+        let hasWarning = externalFileNotice != nil || autosaveWarning != nil
+        let symbol = hasWarning ? "exclamationmark.circle.fill" : "circle"
         statusImage.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
-        statusImage.contentTintColor = autosaveWarning == nil ? AppPalette.secondaryText : AppPalette.warning
+        statusImage.contentTintColor = hasWarning ? AppPalette.warning : AppPalette.secondaryText
     }
 
     private func updateStatus(_ session: ProjectBuildSession) {
@@ -822,6 +1131,10 @@ final class WorkspaceController: NSViewController {
             (message, symbol, color) = ("Ready", "circle", AppPalette.secondaryText)
         case .building:
             (message, symbol, color) = ("Compiling with Tectonic…", "arrow.clockwise", AppPalette.accent)
+        case .stopping:
+            (message, symbol, color) = ("Stopping compilation…", "stop.circle", AppPalette.secondaryText)
+        case .stopped:
+            (message, symbol, color) = ("Compilation stopped", "stop.circle", AppPalette.secondaryText)
         case .complete:
             (message, symbol, color) = ("Build complete", "checkmark.circle.fill", AppPalette.success)
         case .outdated:
@@ -830,11 +1143,14 @@ final class WorkspaceController: NSViewController {
             message = !canExport ? "Build failed · See the build log" : "Build failed · Showing the last successful PDF"
             (symbol, color) = ("exclamationmark.circle.fill", AppPalette.error)
         }
-        statusLabel.stringValue = [message, session.target?.lastPathComponent, session.automatic ? "Auto-compile" : nil,
+        let problemCount = session.diagnostics.count
+        let problems = problemCount == 1 ? "1 problem" : "\(problemCount) problems"
+        statusLabel.stringValue = [externalFileNotice, message, problemCount > 0 ? problems : nil, session.target?.lastPathComponent,
+                                   session.automatic ? "Auto-compile" : nil,
                                    autosaveWarning == nil ? nil : "Autosave failed",
                                    session.artifactWarning == nil ? nil : "Build files not saved"]
             .compactMap { $0 }.joined(separator: " · ")
-        let warnings = [autosaveWarning, session.artifactWarning].compactMap { $0 }
+        let warnings = [externalFileNotice, autosaveWarning, session.artifactWarning].compactMap { $0 }
         statusLabel.toolTip = warnings.isEmpty ? nil : warnings.joined(separator: "\n")
         statusImage.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
         statusImage.contentTintColor = color
@@ -906,11 +1222,12 @@ final class WorkspaceController: NSViewController {
         return header
     }
 
-    private func makeZoomControls() -> NSView {
+    private func makePreviewControls() -> NSView {
         let buttons: [(NSButton, String, String, Selector)] = [
             (zoomOutButton, "minus", "Zoom Out (⌘−)", #selector(zoomOut(_:))),
             (zoomInButton, "plus", "Zoom In (⌘+)", #selector(zoomIn(_:))),
-            (fitButton, "arrow.up.left.and.arrow.down.right", "Fit PDF (⌘0)", #selector(fitPDF(_:)))
+            (fitButton, "arrow.up.left.and.arrow.down.right", "Fit PDF (⌘0)", #selector(fitPDF(_:))),
+            (pdfAppearanceButton, "moon", "Use Dark PDF Appearance", #selector(togglePDFAppearance(_:)))
         ]
         for (button, symbol, label, action) in buttons {
             button.title = ""
@@ -926,6 +1243,7 @@ final class WorkspaceController: NSViewController {
             button.widthAnchor.constraint(equalToConstant: 24).isActive = true
             button.heightAnchor.constraint(equalToConstant: 22).isActive = true
         }
+        pdfAppearanceButton.setAccessibilityIdentifier("TogglePDFAppearance")
         zoomLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
         zoomLabel.textColor = AppPalette.secondaryText
         zoomLabel.alignment = .center
@@ -945,10 +1263,26 @@ final class WorkspaceController: NSViewController {
             steppers.topAnchor.constraint(equalTo: tray.topAnchor),
             steppers.bottomAnchor.constraint(equalTo: tray.bottomAnchor)
         ])
-        let controls = NSStackView(views: [tray, fitButton])
+        let controls = NSStackView(views: [tray, fitButton, pdfAppearanceButton])
         controls.alignment = .centerY
         controls.spacing = 4
         return controls
+    }
+
+    @objc private func togglePDFAppearance(_ sender: Any?) {
+        UserDefaults.standard.set(!pdfView.usesDarkAppearance, forKey: Self.pdfDarkAppearanceKey)
+        NotificationCenter.default.post(name: Self.pdfAppearanceDidChange, object: nil)
+    }
+
+    @objc private func updatePDFAppearance(_ notification: Notification? = nil) {
+        let isDark = UserDefaults.standard.bool(forKey: Self.pdfDarkAppearanceKey)
+        pdfView.usesDarkAppearance = isDark
+        let label = isDark ? "Use Light PDF Appearance" : "Use Dark PDF Appearance"
+        pdfAppearanceButton.image = NSImage(systemSymbolName: isDark ? "sun.max" : "moon", accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 11, weight: .semibold))
+        pdfAppearanceButton.contentTintColor = isDark ? AppPalette.accent : AppPalette.secondaryText
+        pdfAppearanceButton.toolTip = label
+        pdfAppearanceButton.setAccessibilityLabel(label)
     }
 
     private func makePreview() -> NSViewController {
@@ -965,13 +1299,20 @@ final class WorkspaceController: NSViewController {
         pdfView.maxScaleFactor = 5
         pdfView.isHidden = true
         pdfView.onSourceJump = { [weak self] page, point in self?.showSourceFromPDF(pageIndex: page, point: point) == true }
+        pdfSearchBar.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(pdfSearchBar)
+        NSLayoutConstraint.activate([
+            pdfSearchBar.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            pdfSearchBar.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            pdfSearchBar.topAnchor.constraint(equalTo: container.topAnchor)
+        ])
         for child in [pdfView, previewPlaceholder] {
             child.translatesAutoresizingMaskIntoConstraints = false
             container.addSubview(child)
             NSLayoutConstraint.activate([
                 child.leadingAnchor.constraint(equalTo: container.leadingAnchor),
                 child.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-                child.topAnchor.constraint(equalTo: container.topAnchor),
+                child.topAnchor.constraint(equalTo: pdfSearchBar.bottomAnchor),
                 child.bottomAnchor.constraint(equalTo: container.bottomAnchor)
             ])
         }
@@ -1006,11 +1347,10 @@ final class WorkspaceController: NSViewController {
     }
 
     private func makeLogPanel() {
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
-        scroll.autohidesScrollers = true
-        scroll.backgroundColor = AppPalette.editor
-        scroll.documentView = logView
+        rawLogScroll.hasVerticalScroller = true
+        rawLogScroll.autohidesScrollers = true
+        rawLogScroll.backgroundColor = AppPalette.editor
+        rawLogScroll.documentView = logView
         logView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         logView.backgroundColor = AppPalette.editor
         logView.textColor = AppPalette.text
@@ -1021,14 +1361,28 @@ final class WorkspaceController: NSViewController {
         logView.isVerticallyResizable = true
         logView.autoresizingMask = [.width]
         logView.textContainer?.widthTracksTextView = true
-        logView.setAccessibilityLabel("Build Log")
-        errorButton.title = "Go to Error"
-        errorButton.target = self
-        errorButton.action = #selector(goToCompilationError(_:))
-        errorButton.controlSize = .small
-        errorButton.isHidden = true
-        let header = makeHeader(title: "Build Log", symbol: "terminal", accessory: errorButton)
-        for child in [header, scroll] {
+        logView.setAccessibilityLabel("Raw Build Log")
+        logModeControl.segmentCount = 2
+        logModeControl.setLabel("Problems", forSegment: 0)
+        logModeControl.setLabel("Raw Log", forSegment: 1)
+        logModeControl.trackingMode = .selectOne
+        logModeControl.selectedSegment = 0
+        logModeControl.controlSize = .small
+        logModeControl.target = self
+        logModeControl.action = #selector(changeBuildLogMode(_:))
+        logModeControl.setAccessibilityIdentifier("BuildLogMode")
+        logModeControl.setAccessibilityLabel("Build Log View")
+        buildProblems.onNavigate = { [weak self] source in
+            guard let self, let session = buildSession else { return }
+            navigateToSource(file: source.file, line: source.line) { workspace in
+                workspace.attachBuildSession(session)
+                workspace.logModeControl.selectedSegment = 0
+                workspace.changeBuildLogMode(nil)
+                workspace.setLogVisible(true)
+            }
+        }
+        let header = makeHeader(title: "Build Log", symbol: "terminal", accessory: logModeControl)
+        for child in [header, rawLogScroll, buildProblems] {
             child.translatesAutoresizingMaskIntoConstraints = false
             logPanel.addSubview(child)
         }
@@ -1039,16 +1393,40 @@ final class WorkspaceController: NSViewController {
             header.trailingAnchor.constraint(equalTo: logPanel.trailingAnchor),
             header.topAnchor.constraint(equalTo: logPanel.topAnchor),
             headerHeight,
-            scroll.leadingAnchor.constraint(equalTo: logPanel.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: logPanel.trailingAnchor),
-            scroll.topAnchor.constraint(equalTo: header.bottomAnchor),
-            scroll.bottomAnchor.constraint(equalTo: logPanel.bottomAnchor)
         ])
+        for child in [rawLogScroll, buildProblems] {
+            NSLayoutConstraint.activate([
+                child.leadingAnchor.constraint(equalTo: logPanel.leadingAnchor),
+                child.trailingAnchor.constraint(equalTo: logPanel.trailingAnchor),
+                child.topAnchor.constraint(equalTo: header.bottomAnchor),
+                child.bottomAnchor.constraint(equalTo: logPanel.bottomAnchor),
+            ])
+        }
+        updateBuildProblems(nil)
+        changeBuildLogMode(nil)
     }
 
-    @objc private func goToCompilationError(_ sender: Any?) {
-        guard let location = buildSession?.location else { return }
-        _ = navigateToSource(file: location.file, line: location.line)
+    @objc private func changeBuildLogMode(_ sender: Any?) {
+        let showsRawLog = logModeControl.selectedSegment == 1
+        rawLogScroll.isHidden = !showsRawLog
+        buildProblems.isHidden = showsRawLog
+    }
+
+    private func updateBuildProblems(_ session: ProjectBuildSession?) {
+        let diagnostics = session?.diagnostics ?? []
+        let title = diagnostics.isEmpty ? "Problems" : "Problems (\(diagnostics.count))"
+        if logModeControl.label(forSegment: 0) != title { logModeControl.setLabel(title, forSegment: 0) }
+        let emptyMessage: String
+        switch session?.phase {
+        case .building: emptyMessage = "Running Tectonic…"
+        case .stopping: emptyMessage = "Stopping Tectonic…"
+        case .stopped: emptyMessage = "Compilation stopped."
+        case .complete: emptyMessage = "No build problems reported."
+        case .outdated: emptyMessage = "Compile to check the current source."
+        case .failed: emptyMessage = "See the raw build log for details."
+        case .ready, nil: emptyMessage = "No build yet."
+        }
+        buildProblems.update(diagnostics, emptyMessage: emptyMessage)
     }
 
     @discardableResult
@@ -1078,7 +1456,7 @@ final class WorkspaceController: NSViewController {
     }
 
     private func setLogVisible(_ visible: Bool) {
-        if !visible && view.window?.firstResponder === logView {
+        if !visible && (view.window?.firstResponder === logView || buildProblems.hasFocus) {
             focusEditor()
         }
         logPanel.isHidden = !visible
@@ -1145,8 +1523,57 @@ final class WorkspaceController: NSViewController {
         guard let button = sender as? NSButton, let app = NSApp.delegate as? AppDelegate,
               view.window?.attachedSheet == nil else { return }
         let bottom = button.isFlipped ? button.bounds.maxY : button.bounds.minY
-        app.projectMenu(for: projectDirectory).popUp(positioning: nil,
+        let mainDocuments = projectDirectory.map(makeMainDocumentMenu)
+        app.projectMenu(for: projectDirectory, mainDocuments: mainDocuments).popUp(positioning: nil,
             at: NSPoint(x: button.bounds.minX, y: bottom), in: button)
+    }
+
+    private func makeMainDocumentMenu(in folder: URL) -> NSMenu {
+        let root = ProjectBuildSession.normalized(folder)
+        let menu = NSMenu(title: "Main Document")
+        let selected = ProjectBuildSession.selectedMainFile(in: root)
+        let automatic = ProjectBuildSession.automaticMainFile(in: root)
+        let automaticTitle = automatic.map { "Automatic — \($0.lastPathComponent)" } ?? "Automatic"
+        let autoItem = menu.addItem(withTitle: automaticTitle, action: #selector(selectMainDocument(_:)), keyEquivalent: "")
+        autoItem.target = self
+        autoItem.state = selected == nil ? .on : .off
+
+        var candidates = ProjectBuildSession.topLevelTeXFiles(in: root)
+        if let selected, !candidates.contains(selected) { candidates.append(selected) }
+        if !candidates.isEmpty { menu.addItem(.separator()) }
+        for file in candidates {
+            let relativePath = file.pathComponents.dropFirst(root.pathComponents.count).joined(separator: "/")
+            let item = menu.addItem(withTitle: relativePath, action: #selector(selectMainDocument(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = file
+            item.state = file == selected ? .on : .off
+        }
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Choose Another TeX File…", action: #selector(chooseMainDocument(_:)),
+                     keyEquivalent: "").target = self
+        return menu
+    }
+
+    @objc private func selectMainDocument(_ sender: NSMenuItem) {
+        setMainFile(sender.representedObject as? URL)
+    }
+
+    @objc private func chooseMainDocument(_ sender: Any?) {
+        guard let root = projectDirectory, let window = view.window, window.attachedSheet == nil else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Choose Main Document"
+        panel.prompt = "Set Main Document"
+        panel.directoryURL = root
+        panel.allowedContentTypes = ["tex", "ltx"].compactMap { UTType(filenameExtension: $0) }
+        Task { [weak self] in
+            guard await panel.beginSheetModal(for: window) == .OK, let file = panel.url, let self else { return }
+            if !setMainFile(file) {
+                let alert = NSAlert()
+                alert.messageText = "Choose a TeX File in This Project"
+                alert.informativeText = "The main document must be inside the project folder."
+                _ = await alert.beginSheetModal(for: window)
+            }
+        }
     }
 
     @objc private func showLayoutMenu(_ sender: NSButton) {
@@ -1173,7 +1600,7 @@ final class WorkspaceController: NSViewController {
     }
 
     private func updateToolbar() {
-        compileButton.update(enabled: canCompile, building: buildSession?.phase == .building)
+        compileButton.update(phase: buildSession?.phase, targetName: buildSession?.target?.lastPathComponent)
         updateSourceJumpButton()
         let name = projectDirectory?.lastPathComponent ?? ""
         projectButton.title = name.isEmpty ? AppIdentity.displayName : name
@@ -1192,23 +1619,23 @@ final class WorkspaceController: NSViewController {
 private final class PDFPreviewHeader: WorkspaceSurface {
     private let compileButton: PreviewCompileButton
     private let navigator: PDFPageNavigator
-    private let zoomControls: NSView
+    private let trailingControls: NSView
     private let zoomLabel: NSTextField
     private let rule = WorkspaceSurface(AppPalette.rule)
-    private let zoomSize: NSSize
+    private let controlsSize: NSSize
     private let zoomLabelWidth: CGFloat
 
-    init(compileButton: PreviewCompileButton, navigator: PDFPageNavigator, zoomControls: NSView,
+    init(compileButton: PreviewCompileButton, navigator: PDFPageNavigator, trailingControls: NSView,
          zoomLabel: NSTextField) {
         self.compileButton = compileButton
         self.navigator = navigator
-        self.zoomControls = zoomControls
+        self.trailingControls = trailingControls
         self.zoomLabel = zoomLabel
-        zoomSize = zoomControls.fittingSize
+        controlsSize = trailingControls.fittingSize
         zoomLabelWidth = zoomLabel.fittingSize.width
         super.init(AppPalette.chrome)
         setAccessibilityLabel("PDF Preview")
-        for child in [compileButton, navigator, zoomControls, rule] { addSubview(child) }
+        for child in [compileButton, navigator, trailingControls, rule] { addSubview(child) }
     }
 
     required init?(coder: NSCoder) { nil }
@@ -1216,20 +1643,25 @@ private final class PDFPreviewHeader: WorkspaceSurface {
     override func layout() {
         super.layout()
         let navigationSize = navigator.intrinsicContentSize
-        let compact = !navigator.isHidden && bounds.width < navigationSize.width + 2 * (zoomSize.width + 14)
+        let navigationWidth = navigator.isHidden ? 0 : navigationSize.width
+        let regularEdge: CGFloat = 10
+        let regularGap: CGFloat = 6
+        let regularWidth = PreviewCompileButton.regularWidth + navigationWidth + controlsSize.width
+            + 2 * (regularEdge + regularGap)
+        let compact = bounds.width < regularWidth
         compileButton.isCompact = compact
         zoomLabel.isHidden = compact
-        let edge: CGFloat = compact ? 6 : 10
-        let gap: CGFloat = compact ? 4 : 6
+        let edge = compact ? 6 : regularEdge
+        let gap = compact ? 4 : regularGap
         let compileSize = compileButton.intrinsicContentSize
         compileButton.frame = NSRect(x: bounds.minX + edge, y: floor(bounds.midY - compileSize.height / 2),
                                      width: compileSize.width, height: compileSize.height)
-        let zoomWidth = compact ? zoomSize.width - zoomLabelWidth : zoomSize.width
-        zoomControls.frame = NSRect(x: bounds.maxX - edge - zoomWidth, y: floor(bounds.midY - zoomSize.height / 2),
-                                    width: zoomWidth, height: zoomSize.height)
+        let controlsWidth = compact ? controlsSize.width - zoomLabelWidth : controlsSize.width
+        trailingControls.frame = NSRect(x: bounds.maxX - edge - controlsWidth, y: floor(bounds.midY - controlsSize.height / 2),
+                                         width: controlsWidth, height: controlsSize.height)
         let left = compileButton.frame.maxX + gap
-        let right = zoomControls.frame.minX - gap
-        let width = max(0, min(navigationSize.width, right - left))
+        let right = trailingControls.frame.minX - gap
+        let width = max(0, min(navigationWidth, right - left))
         let preferredX = bounds.midX - width / 2
         let x = min(max(left, preferredX), right - width)
         navigator.frame = NSRect(x: x, y: floor(bounds.midY - navigationSize.height / 2), width: width,
@@ -1239,11 +1671,12 @@ private final class PDFPreviewHeader: WorkspaceSurface {
 }
 
 private final class PreviewCompileButton: NSButton {
+    static let regularWidth: CGFloat = 104
     private static let play = NSImage(systemSymbolName: "play.fill", accessibilityDescription: nil)?
         .withSymbolConfiguration(.init(pointSize: 10, weight: .semibold))
-    private static let building = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)?
-        .withSymbolConfiguration(.init(pointSize: 11, weight: .semibold))
-    private var isBuilding = false
+    private static let stop = NSImage(systemSymbolName: "stop.fill", accessibilityDescription: nil)?
+        .withSymbolConfiguration(.init(pointSize: 10, weight: .semibold))
+    private var showsStop = false
     var isCompact = false {
         didSet {
             if oldValue != isCompact { needsDisplay = true }
@@ -1254,19 +1687,29 @@ private final class PreviewCompileButton: NSButton {
         super.init(frame: frame)
         isBordered = false
         font = .systemFont(ofSize: 12, weight: .semibold)
-        toolTip = "Compile PDF (⌘R)"
         setAccessibilityIdentifier("CompilePDF")
-        update(enabled: false, building: false)
+        update(phase: nil, targetName: nil)
     }
 
     required init?(coder: NSCoder) { nil }
 
-    override var intrinsicContentSize: NSSize { NSSize(width: isCompact ? 28 : 104, height: 27) }
+    override var intrinsicContentSize: NSSize { NSSize(width: isCompact ? 28 : Self.regularWidth, height: 27) }
 
-    func update(enabled: Bool, building: Bool) {
-        isEnabled = enabled
-        isBuilding = building
-        title = building ? "Compiling…" : "Compile PDF"
+    func update(phase: ProjectBuildSession.Phase?, targetName: String?) {
+        isEnabled = phase != nil && phase != .stopping
+        showsStop = phase == .building || phase == .stopping
+        switch phase {
+        case .building:
+            title = "Stop"
+            toolTip = "Stop Compilation (⌘.)"
+        case .stopping:
+            title = "Stopping…"
+            toolTip = "Stopping compilation"
+        default:
+            title = "Compile PDF"
+            toolTip = targetName.map { "Compile \($0) (⌘R)" } ?? "Compile PDF (⌘R)"
+        }
+        setAccessibilityLabel(toolTip)
         needsDisplay = true
     }
 
@@ -1275,18 +1718,18 @@ private final class PreviewCompileButton: NSButton {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        let color = !isEnabled ? AppPalette.control
+        let color = !isEnabled || showsStop ? (isHighlighted ? AppPalette.hover : AppPalette.control)
             : isHighlighted ? AppPalette.actionPressed : AppPalette.action
         color.setFill()
         buttonPath.fill()
 
-        let tint = isEnabled ? AppPalette.actionText : (isBuilding ? AppPalette.secondaryText : AppPalette.disabledText)
+        let tint = !isEnabled ? AppPalette.disabledText : showsStop ? AppPalette.error : AppPalette.actionText
         let attributes: [NSAttributedString.Key: Any] = [
             .font: font ?? NSFont.systemFont(ofSize: 12), .foregroundColor: tint
         ]
         let label = (isCompact ? "" : title) as NSString
         let size = label.size(withAttributes: attributes)
-        let symbol = isBuilding ? Self.building : Self.play
+        let symbol = showsStop ? Self.stop : Self.play
         let iconWidth: CGFloat = symbol == nil ? 0 : 11
         let gap: CGFloat = iconWidth > 0 && !isCompact ? 6 : 0
         let start = bounds.midX - (iconWidth + gap + size.width) / 2
