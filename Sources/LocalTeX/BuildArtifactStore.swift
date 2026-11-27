@@ -6,13 +6,22 @@ final class BuildArtifactStore: @unchecked Sendable {
     struct Ticket {
         fileprivate let folder: URL
         fileprivate let targetName: String
+        fileprivate let previewName: String?
         fileprivate let id: UUID
+    }
+
+    struct SharedPreview: Equatable {
+        let url: URL
+        fileprivate let modifiedAt: Date?
+        fileprivate let size: UInt64?
+        fileprivate let fileNumber: UInt64?
     }
 
     static let shared = BuildArtifactStore()
     static let folderName = ".pagequoin-build"
 
     private static let markerName = ".pagequoin-owned"
+    private static let previewsName = "previews"
     private static let marker = Data("PageQuoin Build Artifacts v1\n".utf8)
     private let files = FileManager.default
     private let lock = NSLock()
@@ -25,17 +34,64 @@ final class BuildArtifactStore: @unchecked Sendable {
         let root = projectRoot ?? target.deletingLastPathComponent()
         let folder = buildFolder(in: root)
         let source = target.resolvingSymlinksInPath().standardizedFileURL
-        let prefix = folder.deletingLastPathComponent().pathComponents
-        let path = source.pathComponents.starts(with: prefix)
-            ? source.pathComponents.dropFirst(prefix.count).joined(separator: "/")
-            : source.path
-        let hash = SHA256.hash(data: Data(path.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+        let relative = relativePath(source, in: folder.deletingLastPathComponent())
+        let hash = targetHash(relative ?? source.path)
         let title = source.deletingPathExtension().lastPathComponent.prefix(40)
             .map { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" ? $0 : "-" }
         let targetName = String(title) + "-" + hash
-        let ticket = Ticket(folder: folder, targetName: targetName, id: UUID())
+        let ticket = Ticket(folder: folder, targetName: targetName,
+                            previewName: relative == nil ? nil : hash + ".pdf", id: UUID())
         lock.withLock { active[folder, default: [:]][targetName] = ticket.id }
         return ticket
+    }
+
+    func publishSharedPreview(_ source: URL, artifactDirectory: URL?, for ticket: Ticket,
+                              commit: (() throws -> Void) throws -> Void) throws {
+        guard let name = ticket.previewName else { return }
+        try lock.withLock {
+            guard active[ticket.folder]?[ticket.targetName] == ticket.id else { return }
+            try prepare(ticket.folder)
+            let folder = ticket.folder.appendingPathComponent(Self.previewsName, isDirectory: true)
+            if try itemType(at: folder) == nil {
+                do {
+                    try files.createDirectory(at: folder, withIntermediateDirectories: false,
+                                              attributes: [.posixPermissions: 0o700])
+                } catch let error as CocoaError where error.code == .fileWriteFileExists {
+                    guard try itemType(at: folder) == .typeDirectory else { throw error }
+                }
+            }
+            guard try itemType(at: folder) == .typeDirectory else { throw StorageError.unmanagedDirectory(folder) }
+
+            let staged = folder.appendingPathComponent(".incoming-preview-\(ticket.id)")
+            defer { try? files.removeItem(at: staged) }
+            // Retain the successful PDF independently of the next build's diagnostic files.
+            let linked = artifactDirectory.map { directory in
+                (try? files.linkItem(at: directory.appendingPathComponent(source.lastPathComponent), to: staged)) != nil
+            } ?? false
+            if !linked { try files.copyItem(at: source, to: staged) }
+            let destination = folder.appendingPathComponent(name)
+            try commit {
+                let result = staged.path.withCString { from in
+                    destination.path.withCString { to in rename(from, to) }
+                }
+                if result != 0 { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+            }
+        }
+    }
+
+    func sharedPreview(in root: URL, target: URL) -> SharedPreview? {
+        let folder = buildFolder(in: root)
+        let source = target.resolvingSymlinksInPath().standardizedFileURL
+        guard let relative = relativePath(source, in: folder.deletingLastPathComponent()),
+              (try? owns(folder)) == true else { return nil }
+        let previews = folder.appendingPathComponent(Self.previewsName, isDirectory: true)
+        guard (try? itemType(at: previews)) == .typeDirectory else { return nil }
+        let url = previews.appendingPathComponent(targetHash(relative) + ".pdf")
+        guard let attributes = try? files.attributesOfItem(atPath: url.path),
+              attributes[.type] as? FileAttributeType == .typeRegular else { return nil }
+        return SharedPreview(url: url, modifiedAt: attributes[.modificationDate] as? Date,
+                             size: (attributes[.size] as? NSNumber)?.uint64Value,
+                             fileNumber: (attributes[.systemFileNumber] as? NSNumber)?.uint64Value)
     }
 
     func finish(_ ticket: Ticket) {
@@ -89,6 +145,16 @@ final class BuildArtifactStore: @unchecked Sendable {
     private func buildFolder(in root: URL) -> URL {
         root.resolvingSymlinksInPath().standardizedFileURL
             .appendingPathComponent(Self.folderName, isDirectory: true)
+    }
+
+    private func relativePath(_ source: URL, in root: URL) -> String? {
+        let prefix = root.pathComponents
+        guard source.pathComponents.count > prefix.count, source.pathComponents.starts(with: prefix) else { return nil }
+        return source.pathComponents.dropFirst(prefix.count).joined(separator: "/")
+    }
+
+    private func targetHash(_ path: String) -> String {
+        SHA256.hash(data: Data(path.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
     }
 
     private func prepare(_ folder: URL) throws {

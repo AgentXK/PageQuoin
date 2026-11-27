@@ -32,6 +32,7 @@ final class ProjectBuildSession {
     private var automaticTask: Task<Void, Never>?
     private var compileAgain = false
     private var revision = 0
+    private var sharedPreviewVersion: BuildArtifactStore.SharedPreview?
     private(set) var phase = Phase.ready
     private(set) var preview: Preview?
     private(set) var log = "No build log yet."
@@ -62,6 +63,7 @@ final class ProjectBuildSession {
         if let existing = sessions.object(forKey: key) { return existing }
         let session = ProjectBuildSession(root: root, target: target)
         sessions.setObject(session, forKey: key)
+        session.refreshSharedPreview()
         return session
     }
 
@@ -85,8 +87,15 @@ final class ProjectBuildSession {
 
     static func selectedMainFile(in folder: URL) -> URL? {
         let root = normalized(folder)
-        guard let saved = UserDefaults.standard.dictionary(forKey: mainKey)?[root.path] as? String else { return nil }
-        return texFile(URL(fileURLWithPath: saved), in: root)
+        let shared = SharedProjectStore()
+        if let selection = shared.mainSelection(for: root) {
+            return selection.selectedMain.flatMap { texFile(root.appendingPathComponent($0), in: root) }
+        }
+        guard shared.usesDefaultDirectory,
+              let saved = UserDefaults.standard.dictionary(forKey: mainKey)?[root.path] as? String,
+              let file = texFile(URL(fileURLWithPath: saved), in: root) else { return nil }
+        try? shared.saveMain(file, in: root, ifMissing: true)
+        return file
     }
 
     static func automaticMainFile(in folder: URL) -> URL? {
@@ -108,6 +117,10 @@ final class ProjectBuildSession {
         let root = normalized(folder)
         let selected = file.flatMap { texFile($0, in: root) }
         guard file == nil || selected != nil else { return false }
+        let shared = SharedProjectStore()
+        do { try shared.saveMain(selected, in: root) }
+        catch { return false }
+        guard shared.usesDefaultDirectory else { return true }
         var settings = UserDefaults.standard.dictionary(forKey: mainKey) ?? [:]
         settings[root.path] = selected?.path
         UserDefaults.standard.set(settings, forKey: mainKey)
@@ -176,6 +189,22 @@ final class ProjectBuildSession {
 
     func detach(_ workspace: WorkspaceController) {
         workspaces.remove(workspace)
+    }
+
+    func refreshSharedPreview() {
+        guard !isBuilding, let root, let target,
+              let saved = BuildArtifactStore.shared.sharedPreview(in: root, target: target),
+              saved != sharedPreviewVersion,
+              let data = try? Data(contentsOf: saved.url, options: .mappedIfSafe),
+              data.starts(with: "%PDF-".utf8) else { return }
+        if data == preview?.data {
+            sharedPreviewVersion = saved
+            return
+        }
+        guard let document = PDFDocument(data: data), document.pageCount > 0 else { return }
+        sharedPreviewVersion = saved
+        preview = Preview(data: data, document: document, syncTeX: nil)
+        publish()
     }
 
     func keepPreview(from previous: ProjectBuildSession) {

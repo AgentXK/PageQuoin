@@ -868,7 +868,9 @@ final class WorkspaceController: NSViewController {
     }
 
     @objc private func refreshOutlineOnActivation(_ notification: Notification) {
-        if isViewLoaded, view.window?.isMainWindow == true { refreshProjectOutline() }
+        guard isViewLoaded, view.window?.isMainWindow == true else { return }
+        bindBuildSession()
+        buildSession?.refreshSharedPreview()
     }
 
     private func projectOutlineSource() -> ProjectOutline {

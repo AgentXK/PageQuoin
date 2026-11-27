@@ -25,6 +25,7 @@ final class FileTreeController: NSViewController, NSOutlineViewDataSource, NSOut
     private let scroll = NSScrollView()
     private var creationButtons: [NSButton] = []
     private var root: Entry?
+    private var watcher: ProjectFileWatcher?
     private var mainFile: URL?
 
     var onOpenFile: ((URL) -> Void)?
@@ -117,14 +118,21 @@ final class FileTreeController: NSViewController, NSOutlineViewDataSource, NSOut
     func setRoot(_ url: URL?) -> Bool {
         let normalized = url?.standardizedFileURL
         guard root?.url.path != normalized?.path else { return false }
+        watcher = nil
         root = normalized.map { Entry(url: $0, isDirectory: true) }
+        if let normalized {
+            watcher = ProjectFileWatcher(root: normalized) { [weak self] in
+                guard let self, root?.url == normalized, isViewLoaded else { return }
+                if reload() { onRefresh?() }
+            }
+        }
         if isViewLoaded {
             updateRows()
         }
         return true
     }
 
-    func selectFile(_ url: URL?) {
+    func selectFile(_ url: URL?, scrollToSelection: Bool = true) {
         _ = view
         guard let url, let ancestry = entries(to: url), let entry = ancestry.last else {
             tree.deselectAll(nil)
@@ -136,7 +144,7 @@ final class FileTreeController: NSViewController, NSOutlineViewDataSource, NSOut
         let row = tree.row(forItem: entry)
         guard row >= 0 else { return }
         tree.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-        tree.scrollRowToVisible(row)
+        if scrollToSelection { tree.scrollRowToVisible(row) }
     }
 
     func setMainFile(_ url: URL?) {
@@ -155,14 +163,20 @@ final class FileTreeController: NSViewController, NSOutlineViewDataSource, NSOut
         tree.reloadData(forRowIndexes: rows, columnIndexes: IndexSet(integer: 0))
     }
 
-    func reload() {
-        guard let root else { return }
+    @discardableResult
+    func reload() -> Bool {
+        guard let root else { return false }
         _ = view
         let selected = entry(at: tree.selectedRow)?.url
-        let expanded = (0..<tree.numberOfRows).compactMap { row -> URL? in
-            guard let entry = entry(at: row), entry.isDirectory, tree.isItemExpanded(entry) else { return nil }
-            return entry.url
-        }
+        let previous = (0..<tree.numberOfRows).compactMap { entry(at: $0) }
+        let expanded = previous.filter { $0.isDirectory && tree.isItemExpanded($0) }.map(\.url)
+        let wasUnreadable = root.isUnreadable
+        let clip = scroll.contentView
+        var viewport = clip.bounds
+        let firstVisibleRow = tree.rows(in: tree.visibleRect).location
+        let anchor = previous.indices.contains(firstVisibleRow) ? previous[firstVisibleRow].url : nil
+        let rowOffset = anchor == nil ? 0 : viewport.minY - tree.rect(ofRow: firstVisibleRow).minY
+
         root.children = nil
         updateRows()
         for url in expanded {
@@ -170,7 +184,19 @@ final class FileTreeController: NSViewController, NSOutlineViewDataSource, NSOut
                 tree.expandItem(entry)
             }
         }
-        selectFile(selected)
+        selectFile(selected, scrollToSelection: false)
+        if let anchor, let entry = entries(to: anchor)?.last {
+            let row = tree.row(forItem: entry)
+            if row >= 0 { viewport.origin.y = tree.rect(ofRow: row).minY + rowOffset }
+        }
+        clip.scroll(to: clip.constrainBoundsRect(viewport).origin)
+        scroll.reflectScrolledClipView(clip)
+
+        return wasUnreadable != root.isUnreadable || previous.count != tree.numberOfRows
+            || previous.enumerated().contains { row, old in
+                guard let current = entry(at: row) else { return true }
+                return current.url != old.url || current.isDirectory != old.isDirectory || current.kind != old.kind
+            }
     }
 
     private func updateRows() {

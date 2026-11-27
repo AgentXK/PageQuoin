@@ -143,6 +143,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         if let project = projectBeforeQuit { projectHistory.record(project) }
     }
 
+    func applicationDidResignActive(_ notification: Notification) {
+        guard !isFinishingQuit, projectOpenTask == nil, let workspace,
+              let project = snapshot(workspace) else { return }
+        projectHistory.update(project)
+    }
+
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
         true
     }
@@ -267,7 +273,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             guard response == .OK, let directory = panel.url else { return }
             let project = projectHistory.recentProjects().first { $0.directory.path == ProjectHistory.normalized(directory).path }
                 ?? projectHistory.snapshot(directory: directory, activeFile: nil, openFiles: [])
-            if let project { openProject(project) }
+            if let project { openProject(project, reopeningAfter: projectHistory.removedAt(for: directory)) }
         }
     }
 
@@ -275,6 +281,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         guard let directory = sender.representedObject as? URL,
               let project = projectHistory.recentProjects().first(where: { $0.directory.path == directory.path }) else { return }
         openProject(project)
+    }
+
+    @objc private func removeRecentProject(_ sender: NSMenuItem) {
+        guard let directory = sender.representedObject as? URL else { return }
+        do { try projectHistory.remove(directory) }
+        catch { NSApp.presentError(error) }
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -318,6 +330,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         }
         let matches = Dictionary(grouping: projects) { $0.directory.lastPathComponent }
         let currentPath = currentDirectory.map(ProjectHistory.normalized)?.path
+        let removalMenu = NSMenu(title: "Remove from Recent Projects")
         for project in projects {
             let folder = project.directory
             let name = folder.lastPathComponent
@@ -329,35 +342,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             item.toolTip = folder.path
             item.state = folder.path == currentPath ? .on : .off
             menu.addItem(item)
+
+            let remove = removalMenu.addItem(withTitle: title, action: #selector(removeRecentProject(_:)), keyEquivalent: "")
+            remove.target = self
+            remove.representedObject = folder
+            remove.toolTip = folder.path
         }
+        menu.addItem(.separator())
+        let remove = NSMenuItem(title: removalMenu.title, action: nil, keyEquivalent: "")
+        remove.submenu = removalMenu
+        menu.addItem(remove)
     }
 
-    private func openProject(_ project: ProjectHistory.Project) {
+    private func openProject(_ project: ProjectHistory.Project, reopeningAfter removal: Int64? = nil) {
         guard projectOpenTask == nil else { return }
         if let workspace, let current = snapshot(workspace), current.directory != project.directory {
             projectHistory.update(current)
         }
-        if let window = NSApp.orderedWindows.first(where: { window in
+        let existingWindow = NSApp.orderedWindows.first { window in
             guard let workspace = window.contentViewController as? WorkspaceController,
                   let directory = workspace.projectDirectory else { return false }
             return ProjectHistory.normalized(directory).path == project.directory.path
-        }) {
+        }
+        if let window = existingWindow, window.attachedSheet != nil {
             if window.isMiniaturized { window.deminiaturize(nil) }
             window.makeKeyAndOrderFront(nil)
             if !receivedExternalOpen { finishStartupBuild(in: window.contentViewController as? WorkspaceController) }
             return
         }
+        let existing = existingWindow?.contentViewController as? WorkspaceController
         projectOpenTask = Task {
-            let restored = await restoreProject(project)
+            let restored = await restoreProject(project, in: existing)
             let cancelled = Task.isCancelled
-            if !cancelled, let restored, let state = project.workspaceState {
-                restored.restoreProjectWorkspace(state)
-                if let path = restored.documentURL.map(ProjectHistory.normalized)?.path,
-                   let position = project.editorPositions?[path] { restored.restoreEditorPosition(position) }
+            if !cancelled, let restored {
+                if existing != nil { restored.useProjectDirectory(project.directory) }
+                if let state = project.workspaceState { restored.restoreProjectWorkspace(state) }
+                if let file = restored.documentURL { restoreCaret(in: restored, file: file, from: project) }
             }
             projectOpenTask = nil
             guard !cancelled else { return }
-            if let restored, let session = snapshot(restored) { projectHistory.record(session) }
+            if let restored, let session = snapshot(restored) {
+                projectHistory.record(session, replacingShared: true, reopeningAfter: removal)
+            }
             if !receivedExternalOpen { finishStartupBuild(in: restored) }
         }
     }
@@ -368,8 +394,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         if !isFinishingQuit { workspace?.compileAtStartup() }
     }
 
-    private func restoreProject(_ project: ProjectHistory.Project) async -> WorkspaceController? {
-        var current: WorkspaceController?
+    private func restoreCaret(in workspace: WorkspaceController, file: URL, from project: ProjectHistory.Project) {
+        let path = ProjectHistory.normalized(file).path
+        guard let position = project.editorPositions?[path], !workspace.hasMarkedText,
+              NSDocumentController.shared.document(for: file)?.isDocumentEdited != true else { return }
+        workspace.restoreEditorPosition(position)
+    }
+
+    private func restoreProject(_ project: ProjectHistory.Project, in existing: WorkspaceController?) async -> WorkspaceController? {
+        var current = existing
         for file in project.openFiles {
             guard !Task.isCancelled else { return nil }
             let opened: WorkspaceController?
@@ -380,15 +413,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
             }
             if let opened {
                 current = opened
-                if let position = project.editorPositions?[file.path] { opened.restoreEditorPosition(position) }
+                restoreCaret(in: opened, file: file, from: project)
             }
         }
         if let current {
             guard !Task.isCancelled else { return nil }
             if let file = project.activeFile, current.documentURL.map(ProjectHistory.normalized)?.path != file.path,
                let active = await openTab(file, in: current) {
-                if let position = project.editorPositions?[file.path] { active.restoreEditorPosition(position) }
+                restoreCaret(in: active, file: file, from: project)
                 return active
+            }
+            if let window = current.view.window {
+                if window.isMiniaturized { window.deminiaturize(nil) }
+                window.makeKeyAndOrderFront(nil)
             }
             return current
         }

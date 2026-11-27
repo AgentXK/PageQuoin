@@ -33,7 +33,7 @@ private enum OutlineEntry {
 }
 
 private struct OutlineLoader {
-    private static let maxSourceBytes = 2 * 1024 * 1024
+    private static let maxSourceBytes = 32 * 1024 * 1024
     let root: URL
     let workingDirectory: URL
     let openSources: [URL: String]

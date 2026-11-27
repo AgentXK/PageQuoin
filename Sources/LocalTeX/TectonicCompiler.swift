@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 struct CompilationResult: Sendable {
@@ -164,8 +165,10 @@ struct TectonicCompiler {
             output: log, transcript: overlay?.originalPaths(in: transcript, stagedAt: stagedProject) ?? transcript,
             bibliographyLog: bibliographyLog
         )
+        let pdfURL = resultDirectory.appendingPathComponent("texput.pdf")
+        let pdf = process.terminationStatus == 0 ? try? Data(contentsOf: pdfURL) : nil
         let artifactDirectory: URL?
-        let artifactWarning: String?
+        var artifactWarning: String?
         do {
             artifactDirectory = try ticket.flatMap { try store.publish(resultDirectory, for: $0, commit: run.commit) }
             artifactWarning = nil
@@ -174,6 +177,16 @@ struct TectonicCompiler {
         } catch {
             artifactDirectory = nil
             artifactWarning = "Could not save build files in the project. \(error.localizedDescription)"
+        }
+        if let ticket, let pdf, pdf.starts(with: "%PDF-".utf8),
+           let document = CGPDFDocument(pdfURL as CFURL), document.numberOfPages > 0 {
+            do {
+                try store.publishSharedPreview(pdfURL, artifactDirectory: artifactDirectory, for: ticket, commit: run.commit)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                if artifactWarning == nil { artifactWarning = "Could not save the shared PDF. \(error.localizedDescription)" }
+            }
         }
         if let artifactWarning { diagnostics.append(BuildDiagnostic(severity: .warning, message: artifactWarning)) }
         if let artifactDirectory {
@@ -184,8 +197,7 @@ struct TectonicCompiler {
         guard process.terminationStatus == 0 else {
             throw TectonicError.failed(status: process.terminationStatus, log: failureLog, diagnostics: diagnostics)
         }
-        let pdfURL = resultDirectory.appendingPathComponent("texput.pdf")
-        guard let pdf = try? Data(contentsOf: pdfURL), pdf.starts(with: "%PDF-".utf8) else {
+        guard let pdf, pdf.starts(with: "%PDF-".utf8) else {
             throw TectonicError.missingPDF(log: failureLog, diagnostics: diagnostics)
         }
         let syncTeX = ["texput.synctex.gz", "texput.synctex"].lazy

@@ -135,12 +135,16 @@ final class SourceEditorController: NSViewController, NSTextViewDelegate {
         guard location != NSNotFound, let scrollView = textView.enclosingScrollView else { return nil }
         let clip = scrollView.contentView
         return .init(caretOffset: location, scrollY: clip.bounds.minY,
-                     caretWasVisible: isCaretVisible(in: clip), upstreamAffinity: textView.selectionAffinity == .upstream)
+                     caretWasVisible: isCaretVisible(in: clip), upstreamAffinity: textView.selectionAffinity == .upstream,
+                     normalizedCaretOffset: SharedProjectStore.normalizedCaretOffset(location, in: textView.string))
     }
 
     func restoreEditorPosition(_ position: ProjectHistory.EditorPosition) {
-        let source = textView.string as NSString
-        let offset = min(max(0, position.caretOffset), source.length)
+        let text = textView.string
+        let source = text as NSString
+        let saved = position.normalizedCaretOffset.map { SharedProjectStore.rawCaretOffset($0, in: text) }
+            ?? position.caretOffset
+        let offset = min(max(0, saved), source.length)
         let location = offset < source.length ? source.rangeOfComposedCharacterSequence(at: offset).location : offset
         let range = NSRange(location: location, length: 0)
         textView.setSelectedRange(range, affinity: position.upstreamAffinity == true ? .upstream : .downstream,

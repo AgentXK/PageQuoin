@@ -1,0 +1,28 @@
+{
+  "name": "pagequoin-terminal",
+  "version": "1.2.0",
+  "private": true,
+  "description": "PageQuoin's cross-platform terminal LaTeX editor",
+  "type": "module",
+  "files": [
+    "src"
+  ],
+  "bin": {
+    "pagequoin": "./src/cli.mjs",
+    "pq": "./src/cli.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/cli.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "clipboardy": "5.3.2",
+    "ink": "8.0.0",
+    "open": "11.0.4",
+    "react": "19.3.1",
+    "string-width": "9.0.0"
+  }
+}
