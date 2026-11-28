@@ -2,7 +2,16 @@ import stringWidth from 'string-width';
 
 const graphemes = new Intl.Segmenter(undefined, {granularity: 'grapheme'});
 const nonPrintableASCII = /[^\x20-\x7e]/;
+const closingSymbol = new Map([['(', ')'], ['[', ']'], ['{', '}'], ['"', '"'], ["'", "'"]]);
+const pairContext = /[\s,.;:!?)}\]"']/u;
+const wordCharacter = /^[\p{L}\p{M}\p{N}_]$/u;
 export const safeText = text => text.replace(/[\p{Cc}\u202a-\u202e\u2066-\u2069]/gu, '�');
+
+function isEscaped(text, offset) {
+  let start = offset;
+  while (text[start - 1] === '\\') start--;
+  return (offset - start) % 2 === 1;
+}
 
 function previous(text, index) {
   return graphemes.segment(text).containing(index - 1)?.index ?? 0;
@@ -28,6 +37,19 @@ function offsetAtCell(text, cell) {
   return text.length;
 }
 
+function offsetAfterComments(offset, prefixes) {
+  let low = -1;
+  let high = prefixes.length;
+  while (high - low > 1) {
+    const middle = Math.floor((low + high) / 2);
+    if (prefixes[middle].start <= offset) low = middle;
+    else high = middle;
+  }
+  if (low < 0) return offset;
+  const {end, after} = prefixes[low];
+  return after + Math.max(0, offset - end);
+}
+
 export function insertable(text) {
   return text.replace(/\r\n?/g, '\n').replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '');
 }
@@ -42,6 +64,7 @@ export class EditorBuffer {
   #lines;
   #column;
   #anchor;
+  #generatedClosers = new Set();
 
   constructor(file, snapshot) {
     this.file = file;
@@ -63,6 +86,12 @@ export class EditorBuffer {
 
   clearSelection() {
     this.#anchor = undefined;
+  }
+
+  selectAll() {
+    this.#anchor = 0;
+    this.cursor = this.text.length;
+    this.#column = undefined;
   }
 
   get lines() {
@@ -136,6 +165,83 @@ export class EditorBuffer {
     this.replace(range?.start ?? this.cursor, range?.end ?? this.cursor, text);
   }
 
+  lineCut() {
+    const {row} = this.position;
+    const line = this.lines[row];
+    const following = this.lines[row + 1];
+    // At EOF, remove the previous separator so the cut does not leave an empty line.
+    const start = following ? line.start : Math.max(0, line.start - 1);
+    const end = following?.start ?? this.text.length;
+    return {start, end, text: this.text.slice(start, end)};
+  }
+
+  toggleLineComment() {
+    const range = this.selection;
+    const first = range ? this.#positionAt(range.start).row : this.position.row;
+    const last = range ? this.#positionAt(range.end - 1).row : first;
+    const prefixes = [];
+    const lines = this.lines;
+    for (let row = first; row <= last; row++) {
+      const {start, text} = lines[row];
+      const indent = /^[ \t]*/.exec(text)[0].length;
+      if (first !== last && indent === text.length) continue;
+      const marker = text[indent] === '%' ? (text[indent + 1] === ' ' ? 2 : 1) : 0;
+      prefixes.push({start: start + indent, marker});
+    }
+    if (!prefixes.length) return false;
+    const uncomment = prefixes.every(prefix => prefix.marker > 0);
+    const replacement = uncomment ? '' : '% ';
+    const start = prefixes[0].start;
+    const chunks = [];
+    let end = start;
+    let delta = 0;
+    for (const prefix of prefixes) {
+      chunks.push(this.text.slice(end, prefix.start), replacement);
+      const removed = uncomment ? prefix.marker : 0;
+      end = prefix.start + removed;
+      delta += replacement.length - removed;
+      prefix.end = end;
+      prefix.after = end + delta;
+    }
+
+    const cursor = offsetAfterComments(this.cursor, prefixes);
+    const anchor = range ? offsetAfterComments(this.#anchor, prefixes) : undefined;
+    const addedClosers = [];
+    for (const offset of this.#generatedClosers) {
+      if (offset >= start && offset < end) addedClosers.push(offsetAfterComments(offset, prefixes));
+    }
+    this.replace(start, end, chunks.join(''), {cursor, anchor, addedClosers});
+    return true;
+  }
+
+  #type(text) {
+    const {cursor} = this;
+    const range = this.selection;
+    const closing = closingSymbol.get(text);
+    if (!range && this.#generatedClosers.has(cursor) && this.text[cursor] === text && !isEscaped(this.text, cursor)) {
+      this.#generatedClosers.delete(cursor);
+      this.moveHorizontal(1);
+      return;
+    }
+    if (closing && (range || this.#canPair(text, closing))) {
+      const start = range?.start ?? cursor;
+      const end = range?.end ?? cursor;
+      const inner = end + text.length;
+      this.replace(start, end, text + this.text.slice(start, end) + closing, {cursor: inner, addedClosers: [inner]});
+      return;
+    }
+    this.insertText(text);
+  }
+
+  #canPair(opening, closing) {
+    const {cursor, text} = this;
+    const following = text[cursor];
+    if (isEscaped(text, cursor) || (following !== undefined && !pairContext.test(following))) return false;
+    if (opening !== closing) return true;
+    const preceding = Array.from(text.slice(Math.max(0, cursor - 2), cursor)).at(-1) ?? '';
+    return following !== opening && !wordCharacter.test(preceding);
+  }
+
   deleteSelection() {
     const range = this.selection;
     if (!range) return false;
@@ -143,21 +249,37 @@ export class EditorBuffer {
     return true;
   }
 
-  replace(start, end, value) {
+  replace(start, end, value, {cursor = start + value.length, anchor, addedClosers = []} = {}) {
     if (start === end && !value) return;
-    const edit = {start, before: this.cursor, old: this.text.slice(start, end), value};
+    const edit = {start, before: this.cursor, after: cursor, beforeAnchor: anchor === undefined ? undefined : this.#anchor,
+      afterAnchor: anchor, old: this.text.slice(start, end), value, addedClosers};
+    edit.removedClosers = this.#apply(start, edit.old.length, value, cursor);
+    this.#anchor = anchor;
+    for (const offset of addedClosers) this.#generatedClosers.add(offset);
     this.#undo.push(edit);
     if (this.#undo.length > 100) this.#undo.shift();
     this.#redo = [];
-    this.#apply(start, edit.old.length, value, start + value.length);
   }
 
   #apply(start, length, value, cursor) {
-    this.text = this.text.slice(0, start) + value + this.text.slice(start + length);
+    const end = start + length;
+    const removedClosers = [];
+    if (this.#generatedClosers.size) {
+      const remaining = new Set();
+      const delta = value.length - length;
+      for (const offset of this.#generatedClosers) {
+        if (offset < start) remaining.add(offset);
+        else if (offset >= end) remaining.add(offset + delta);
+        else removedClosers.push(offset);
+      }
+      this.#generatedClosers = remaining;
+    }
+    this.text = this.text.slice(0, start) + value + this.text.slice(end);
     this.cursor = cursor;
     this.#lines = undefined;
     this.#column = undefined;
     this.clearSelection();
+    return removedClosers;
   }
 
   undo() {
@@ -165,13 +287,17 @@ export class EditorBuffer {
     if (!edit) return;
     this.#redo.push(edit);
     this.#apply(edit.start, edit.value.length, edit.old, edit.before);
+    this.#anchor = edit.beforeAnchor;
+    for (const offset of edit.removedClosers) this.#generatedClosers.add(offset);
   }
 
   redo() {
     const edit = this.#redo.pop();
     if (!edit) return;
     this.#undo.push(edit);
-    this.#apply(edit.start, edit.old.length, edit.value, edit.start + edit.value.length);
+    this.#apply(edit.start, edit.old.length, edit.value, edit.after);
+    this.#anchor = edit.afterAnchor;
+    for (const offset of edit.addedClosers) this.#generatedClosers.add(offset);
   }
 
   moveHorizontal(direction) {
@@ -228,7 +354,11 @@ export class EditorBuffer {
       this.cursor = start + (key.end ? text.length : 0);
       this.#column = undefined;
     } else if (key.backspace) {
-      if (!this.deleteSelection()) this.replace(column ? start + previous(text, column) : Math.max(0, cursor - 1), cursor, '');
+      if (this.deleteSelection()) return;
+      const opening = column ? start + previous(text, column) : Math.max(0, cursor - 1);
+      const paired = this.#generatedClosers.has(cursor) &&
+        closingSymbol.get(this.text.slice(opening, cursor)) === this.text[cursor];
+      this.replace(opening, cursor + Number(paired), '');
     } else if (key.delete) {
       if (!this.deleteSelection()) this.replace(cursor, column < text.length ? start + next(text, column) : Math.min(this.text.length, cursor + 1), '');
     } else if (key.return) {
@@ -236,7 +366,7 @@ export class EditorBuffer {
       const prefix = this.lines[insertion.row].text.slice(0, insertion.column);
       this.insertText('\n' + (prefix.match(/^\s*/)?.[0] ?? ''));
     } else if (key.tab) this.insertText('  ');
-    else if (!key.ctrl && !key.meta && !key.escape) this.insertText(insertable(input));
+    else if (!key.ctrl && !key.meta && !key.escape) this.#type(insertable(input));
   }
 }
 

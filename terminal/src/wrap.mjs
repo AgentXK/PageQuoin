@@ -6,7 +6,10 @@ const nonPrintableASCII = /[^\x20-\x7e]/;
 const breakableSpace = /^[ \t\u1680\u2000-\u2006\u2008-\u200B\u205F\u3000]$/u;
 
 function cellWidth(text, column) {
-  return text === '\t' ? 4 - column % 4 : stringWidth(safeText(text));
+  if (text === '\t') return 4 - column % 4;
+  const first = text.charCodeAt(0);
+  if (text.length === 1 && first >= 0x20 && first <= 0x7e) return 1;
+  return stringWidth(safeText(text));
 }
 
 function asciiEnd(text, start, width) {
@@ -30,23 +33,33 @@ export class WrappedLines {
   #lines;
   #width;
   #layouts = new Map();
+  #screenStarts;
+  #previousIndex;
 
-  constructor(lines, width) {
+  constructor(lines, width, previousLayout) {
     this.#lines = lines.length ? lines : [{text: ''}];
     this.#width = Math.max(1, Math.floor(width));
+    if (previousLayout?.#width === this.#width && previousLayout.#screenStarts) {
+      this.#previousIndex = {lines: previousLayout.#lines, starts: previousLayout.#screenStarts};
+    }
+  }
+
+  #newLayout(row) {
+    const text = this.#lines[row].text;
+    const ascii = !nonPrintableASCII.test(text);
+    const fixed = ascii && (text.length <= this.#width || !text.includes(' '));
+    const layout = {row, text, ascii, fixed, parts: [], done: false};
+    if (!ascii) {
+      layout.iterator = graphemes.segment(text)[Symbol.iterator]();
+      layout.pending = [];
+    }
+    return layout;
   }
 
   #layout(row) {
     let layout = this.#layouts.get(row);
     if (!layout) {
-      const text = this.#lines[row].text;
-      const ascii = !nonPrintableASCII.test(text);
-      const fixed = ascii && (text.length <= this.#width || !text.includes(' '));
-      layout = {row, text, ascii, fixed, parts: [], done: false};
-      if (!ascii) {
-        layout.iterator = graphemes.segment(text)[Symbol.iterator]();
-        layout.pending = [];
-      }
+      layout = this.#newLayout(row);
       this.#layouts.set(row, layout);
     }
     return layout;
@@ -105,21 +118,99 @@ export class WrappedLines {
     return {end, right};
   }
 
+  #boundary(layout, start, left) {
+    if (layout.ascii) {
+      const end = asciiEnd(layout.text, start, this.#width);
+      return {end, right: end};
+    }
+    return this.#unicodeEnd(layout, start, left);
+  }
+
+  #isLastPart(text, end, left, right) {
+    // Keep a separate empty row for a caret exactly after a full last row.
+    return end === text.length && right - left < this.#width;
+  }
+
   #append(layout) {
     const {row, text, parts} = layout;
     const previous = parts.at(-1);
     const start = previous?.end ?? 0;
     const left = previous?.right ?? 0;
-    let end, right;
-    if (layout.ascii) {
-      end = asciiEnd(text, start, this.#width);
-      right = end;
-    } else {
-      ({end, right} = this.#unicodeEnd(layout, start, left));
-    }
+    const {end, right} = this.#boundary(layout, start, left);
     parts.push({row, part: parts.length, start, end, left, right});
-    // Keep a separate empty row for a caret exactly after a full last row.
-    layout.done = end === text.length && right - left < this.#width;
+    layout.done = this.#isLastPart(text, end, left, right);
+  }
+
+  #countParts(row) {
+    const cached = this.#layouts.get(row);
+    if (cached?.done) return cached.parts.length;
+    // Count with a separate iterator so indexing does not retain offscreen segments.
+    const layout = this.#newLayout(row);
+    if (layout.fixed) return Math.floor(layout.text.length / this.#width) + 1;
+
+    let count = 1;
+    let left = 0;
+    let {end, right} = this.#boundary(layout, 0, left);
+    while (!this.#isLastPart(layout.text, end, left, right)) {
+      left = right;
+      ({end, right} = this.#boundary(layout, end, left));
+      count++;
+    }
+    return count;
+  }
+
+  #buildScreenStarts() {
+    const {length} = this.#lines;
+    const previous = this.#previousIndex;
+    this.#previousIndex = undefined;
+    let first = 0;
+    let end = length;
+    let previousEnd = previous?.lines.length ?? 0;
+    if (previous) {
+      const common = Math.min(end, previousEnd);
+      while (first < common && this.#lines[first].text === previous.lines[first].text) first++;
+      if (first === end && first === previousEnd) return previous.starts;
+      while (end > first && previousEnd > first && this.#lines[end - 1].text === previous.lines[previousEnd - 1].text) {
+        end--;
+        previousEnd--;
+      }
+    }
+
+    const starts = new Uint32Array(length + 1);
+    if (first) starts.set(previous.starts.subarray(0, first + 1));
+    for (let row = first; row < end; row++) {
+      starts[row + 1] = starts[row] + this.#countParts(row);
+    }
+    if (end < length) {
+      const shift = starts[end] - previous.starts[previousEnd];
+      for (let row = end + 1; row <= length; row++) {
+        previousEnd++;
+        starts[row] = previous.starts[previousEnd] + shift;
+      }
+    }
+    return starts;
+  }
+
+  get screenRowCount() {
+    this.#screenStarts ??= this.#buildScreenStarts();
+    return this.#screenStarts.at(-1);
+  }
+
+  screenIndex({row, part = 0}) {
+    this.#screenStarts ??= this.#buildScreenStarts();
+    return this.#screenStarts[row] + part;
+  }
+
+  atScreenIndex(index) {
+    const target = Math.max(0, Math.min(Math.floor(index), this.screenRowCount - 1));
+    let low = 0;
+    let high = this.#lines.length;
+    while (high - low > 1) {
+      const middle = Math.floor((high + low) / 2);
+      if (this.#screenStarts[middle] <= target) low = middle;
+      else high = middle;
+    }
+    return this.segment({row: low, part: target - this.#screenStarts[low]});
   }
 
   #atPart(layout, requested) {

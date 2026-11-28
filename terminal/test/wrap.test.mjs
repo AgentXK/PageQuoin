@@ -93,3 +93,36 @@ test('uses the rest of a row before splitting a word that needs multiple rows', 
     assert.deepEqual(rows.map(({start, end}) => text.slice(start, end)), expected);
   }
 });
+
+test('indexes screen rows including soft wraps and exact-fill caret rows', () => {
+  const texts = ['hello world', 'a界\t👍🏽z', 'abcde', '', '\t界'];
+  for (const width of [1, 4, 5, 9]) {
+    const expected = wrap(width, ...texts).page({row: 0}, 100);
+    const layout = wrap(width, ...texts);
+    assert.equal(layout.screenRowCount, expected.length);
+    for (const [index, segment] of expected.entries()) {
+      assert.equal(layout.screenIndex(segment), index);
+      assert.deepEqual(layout.atScreenIndex(index), segment);
+    }
+    assert.deepEqual(layout.atScreenIndex(-20), expected[0]);
+    assert.deepEqual(layout.atScreenIndex(200), expected.at(-1));
+  }
+});
+
+test('updates screen row offsets after edits that shift a reusable suffix', () => {
+  const texts = ['hello world', '章\t节', 'a', 'abcde', ''];
+  let layout = wrap(5, ...texts);
+  assert.equal(layout.screenRowCount, 9);
+
+  for (const [width, updated] of [
+    [5, ['hello world', 'new first line', 'new second line', ...texts.slice(2)]],
+    [5, ['hello world', 'a', 'abcde', '']],
+    [5, ['hello world', 'a', 'abcde', '']],
+    [9, ['hello world', 'a', 'abcde', '']],
+  ]) {
+    const expected = wrap(width, ...updated).page({row: 0}, 100);
+    layout = new WrappedLines(updated.map(text => ({text})), width, layout);
+    assert.equal(layout.screenRowCount, expected.length);
+    assert.deepEqual(expected.map((_, index) => layout.atScreenIndex(index)), expected);
+  }
+});

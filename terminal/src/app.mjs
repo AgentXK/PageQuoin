@@ -37,8 +37,11 @@ const help = [
   'Ctrl+O  Open a path              Ctrl+N  New file',
   'Ctrl+G  Next tab                 Click × or Ctrl+W  Close tab',
   'Ctrl+S  Save                     Ctrl+E  Save a copy',
-  'Ctrl+C  Copy   Ctrl+X  Cut       Ctrl+V  Paste',
-  'Ctrl+F  Find in this file        Ctrl+Z / Ctrl+Y  Undo / redo',
+  'Ctrl+C  Copy selection          Ctrl+X  Cut selection or line',
+  'Ctrl+V  Paste                   Ctrl+A  Select all',
+  'Ctrl+F  Find in this file        Alt+G   Go to line',
+  'Ctrl+/  Toggle LaTeX comments   Ctrl+Z / Ctrl+Y  Undo / redo',
+  'Ctrl+Home / Ctrl+End  Go to file start / end',
   'Alt+M   Choose main file         Ctrl+T  Set current TeX as main',
   'Ctrl+R  Save all and compile',
   'Ctrl+P  Open PDF in browser      Ctrl+K  Stop build',
@@ -46,7 +49,7 @@ const help = [
   'Ctrl+L  Build log                Ctrl+Q  Quit',
   'Ctrl+U  Toggle help              Esc  Return to editor',
   'TeX     Type a command, use ↑/↓ to choose and Tab to insert',
-  'Mouse   Drag text to select or drag pane dividers to resize',
+  'Mouse   Select text, resize panes, or drag the editor scrollbar',
 ];
 
 function pointIn(ref, event) {
@@ -112,8 +115,13 @@ function gutterWidth(tab) {
   return Math.max(3, String(tab.lines.length).length) + 3;
 }
 
+function hasScrollbarColumn(tab, width) {
+  return width > gutterWidth(tab) + 3;
+}
+
 function sourceColumns(tab, width) {
-  return Math.max(1, width - gutterWidth(tab) - 2);
+  const rail = Number(hasScrollbarColumn(tab, width));
+  return Math.max(1, width - gutterWidth(tab) - 2 - rail);
 }
 
 const editorLayouts = new WeakMap();
@@ -124,7 +132,7 @@ function editorLayout(tab, width) {
   const lines = tab.lines;
   const cached = editorLayouts.get(tab);
   if (cached?.lines === lines && cached.columns === columns) return cached.layout;
-  const layout = new WrappedLines(lines, columns);
+  const layout = new WrappedLines(lines, columns, cached?.layout);
   editorLayouts.set(tab, {lines, columns, layout});
   return layout;
 }
@@ -138,7 +146,18 @@ function setViewport(tab, anchor) {
   tab.wrapStart = anchor.start;
 }
 
-function editorViewport(tab, width, rows) {
+function scrollbarGeometry(wrap, first, rows) {
+  const total = wrap.screenRowCount;
+  const maxTop = total - rows;
+  if (maxTop <= 0) return null;
+  const top = wrap.screenIndex(first);
+  const thumbHeight = Math.max(1, Math.floor(rows * rows / total));
+  const travel = rows - thumbHeight;
+  const thumbTop = Math.round(top * travel / maxTop);
+  return {top, maxTop, thumbTop, thumbHeight, travel};
+}
+
+function editorViewport(tab, width, rows, showScrollbar = true) {
   const {row, column} = tab.position;
   const wrap = editorLayout(tab, width);
   const cursorRow = wrap.rowAt(row, column);
@@ -155,7 +174,10 @@ function editorViewport(tab, width, rows) {
     page = wrap.page(first, rows);
   }
   setViewport(tab, first);
-  return {wrap, cursorRow, page, column};
+  const scrollbar = showScrollbar && rows >= 2 && page.length === rows && hasScrollbarColumn(tab, width)
+    ? scrollbarGeometry(wrap, first, rows)
+    : null;
+  return {wrap, cursorRow, page, column, scrollbar};
 }
 
 export function App({root, initial, mainFile, initialPDF, entries, session, autosaveDelay = 1000, removedAtOnOpen}) {
@@ -226,7 +248,9 @@ export function App({root, initial, mainFile, initialPDF, entries, session, auto
   const outlineSource = model.main ?? (currentTab && isTeX(currentTab.file) ? currentTab.file : null);
   const sidebarFocused = model.focus === 'files' || model.focus === 'outline';
   const showEditor = model.focus !== 'help' && (wide || !sidebarFocused);
-  const viewport = showEditor && currentTab ? editorViewport(currentTab, editorWidth, shownRows) : null;
+  const viewport = showEditor && currentTab
+    ? editorViewport(currentTab, editorWidth, shownRows, model.resize?.axis !== 'width')
+    : null;
   const activeCompletion = () => !model.prompt && !model.mainPicker && !model.logFocused &&
     model.focus === 'editor' && model.completion?.tab === active() ? model.completion : null;
   const completion = activeCompletion();
@@ -496,8 +520,9 @@ export function App({root, initial, mainFile, initialPDF, entries, session, auto
     editTab(tab, () => tab.replace(start, end, items[index].text));
   }
 
-  async function copySelection(tab, cut) {
-    const text = tab.selectedText;
+  async function copyToClipboard(tab, cut) {
+    const line = cut && !tab.selection ? tab.lineCut() : null;
+    const text = line?.text ?? tab.selectedText;
     if (!text) return;
     model.internalClipboard = text;
     try {
@@ -506,8 +531,12 @@ export function App({root, initial, mainFile, initialPDF, entries, session, auto
     } catch {
       model.useInternalClipboard = true;
     }
-    if (cut) editTab(tab, () => tab.deleteSelection());
-    status((cut ? 'Cut selection' : 'Copied selection') +
+    if (cut) {
+      tab.scrollDetached = false;
+      editTab(tab, () => line ? tab.replace(line.start, line.end, '') : tab.deleteSelection());
+    }
+    const message = line ? 'Cut line' : cut ? 'Cut selection' : 'Copied selection';
+    status(message +
       (model.useInternalClipboard ? ' · PageQuoin clipboard' : ''));
   }
 
@@ -536,6 +565,13 @@ export function App({root, initial, mainFile, initialPDF, entries, session, auto
     if (segment) tab.placeCursorAt(segment.row, wrap.columnAt(segment, cell), extend);
     else tab.placeCursorAt(tab.lines.length, 0, extend);
     tab.scrollDetached = false;
+  }
+
+  function scrollEditorTo(tab, top) {
+    const {wrap, scrollbar} = viewport;
+    const position = Math.max(0, Math.min(scrollbar.maxTop, top));
+    tab.scrollDetached = true;
+    setViewport(tab, wrap.atScreenIndex(position));
   }
 
   function adjustLog(shift) {
@@ -713,6 +749,7 @@ export function App({root, initial, mainFile, initialPDF, entries, session, auto
   function shortcut(input) {
     model.completion = null;
     const tab = active();
+    const editing = tab && model.focus === 'editor' && !model.logFocused;
     switch (input) {
       case 'b':
         model.logFocused = false;
@@ -734,16 +771,29 @@ export function App({root, initial, mainFile, initialPDF, entries, session, auto
       case 's':
         if (tab) void operation(async () => { await model.autosave.save(tab); status('Saved', 'success'); });
         break;
+      case 'a':
+        if (editing) {
+          tab.scrollDetached = false;
+          tab.selectAll();
+        }
+        break;
       case 'c':
-        if (!model.logFocused && model.focus === 'editor' && tab) {
-          if (tab.selection) void operation(() => copySelection(tab, false));
+        if (editing) {
+          if (tab.selection) void operation(() => copyToClipboard(tab, false));
         } else quit();
         break;
       case 'x':
-        if (!model.logFocused && model.focus === 'editor' && tab?.selection) void operation(() => copySelection(tab, true));
+        if (editing) void operation(() => copyToClipboard(tab, true));
         break;
       case 'v':
-        if (!model.logFocused && model.focus === 'editor' && tab) void operation(() => pasteClipboard(tab));
+        if (editing) void operation(() => pasteClipboard(tab));
+        break;
+      case '/':
+      case '_':
+        if (editing && isTeX(tab.file)) {
+          tab.scrollDetached = false;
+          editTab(tab, () => tab.toggleLineComment());
+        }
         break;
       case ' ':
         if (!model.logFocused && model.focus === 'editor') suggest(tab);
@@ -764,6 +814,19 @@ export function App({root, initial, mainFile, initialPDF, entries, session, auto
           model.logFocused = false;
           active().scrollDetached = false;
           status(query && active().find(query) ? 'Match found' : 'No match');
+        });
+        break;
+      case 'go-to-line':
+        if (tab) prompt('Go to line', input => {
+          const value = input.trim();
+          const number = Number(value);
+          if (!/^\d+$/.test(value) || number < 1 || number > tab.lines.length) {
+            throw new Error('Enter a line number from 1 to ' + tab.lines.length + '.');
+          }
+          model.focus = 'editor';
+          model.logFocused = false;
+          tab.scrollDetached = false;
+          tab.placeCursorAt(number - 1, 0);
         });
         break;
       case 'w': closeTab(); break;
@@ -934,7 +997,20 @@ export function App({root, initial, mainFile, initialPDF, entries, session, auto
       shortcut('clean');
       return;
     }
+    if (key.meta && !key.ctrl && input.toLowerCase() === 'g') {
+      shortcut('go-to-line');
+      return;
+    }
     if (key.ctrl) {
+      const tab = active();
+      if ((key.home || key.end) && tab && model.focus === 'editor' && !model.logFocused) {
+        const row = key.end ? tab.lines.length - 1 : 0;
+        model.completion = null;
+        tab.scrollDetached = false;
+        tab.placeCursorAt(row, key.end ? tab.lines[row].text.length : 0, key.shift);
+        refresh();
+        return;
+      }
       shortcut(input.toLowerCase());
       return;
     }
@@ -974,7 +1050,7 @@ export function App({root, initial, mainFile, initialPDF, entries, session, auto
       const tab = active();
       const choosing = suggestion && !key.shift && (key.upArrow || key.downArrow || key.tab);
       const frame = choosing && (suggestion === completion ? completionFrame
-        : frameForCompletion(suggestion, editorViewport(tab, editorWidth, shownRows)));
+        : frameForCompletion(suggestion, editorViewport(tab, editorWidth, shownRows, false)));
       if (frame) {
         if (key.tab) applyCompletion(suggestion, suggestion.index);
         else {
@@ -1037,7 +1113,12 @@ export function App({root, initial, mainFile, initialPDF, entries, session, auto
           (event.type === 'release' && !dragging.moved && dragging.x === event.x && dragging.y === event.y)) return;
       dragging.moved = true;
       const bounds = measureElement(editorPanel.current);
-      placeEditorCursor(tab, {x: event.x - bounds.x, y: event.y - bounds.y}, true);
+      const point = {x: event.x - bounds.x, y: event.y - bounds.y};
+      if (dragging.thumbOffset === undefined) placeEditorCursor(tab, point, true);
+      else if (viewport?.scrollbar) {
+        const {maxTop, travel} = viewport.scrollbar;
+        scrollEditorTo(tab, Math.round((point.y - 2 - dragging.thumbOffset) * maxTop / travel));
+      }
       refresh();
       return;
     }
@@ -1112,11 +1193,24 @@ export function App({root, initial, mainFile, initialPDF, entries, session, auto
         const row = outlinePoint.y - 2;
         if (row >= 0 && row < outlineRows) jumpToHeading(model.outlineTop + row);
       } else if (editorPoint && tab) {
-        model.focus = 'editor';
         const row = editorPoint.y - 2;
         if (row >= 0 && row < shownRows) {
-          placeEditorCursor(tab, editorPoint);
-          model.drag = {tab, x: event.x, y: event.y, moved: false};
+          const scrollbar = viewport?.scrollbar;
+          const gesture = {tab, x: event.x, y: event.y, moved: false};
+          if (scrollbar && editorPoint.x === editorWidth - 2) {
+            const {top, thumbTop, thumbHeight} = scrollbar;
+            if (row >= thumbTop && row < thumbTop + thumbHeight) {
+              model.drag = {...gesture, thumbOffset: row - thumbTop};
+            } else {
+              scrollEditorTo(tab, top + (row < thumbTop ? -shownRows : shownRows));
+            }
+          } else {
+            model.focus = 'editor';
+            placeEditorCursor(tab, editorPoint);
+            model.drag = gesture;
+          }
+        } else {
+          model.focus = 'editor';
         }
       } else return;
     }
@@ -1319,11 +1413,19 @@ function EditorPanel({panelRef, tab, viewport, focused, width, rows}) {
     ' Open a text file or press Ctrl+N.')];
   const detail = tab && ' · ' + safeText(path.basename(tab.file)) + ' · ' +
     (tab.position.row + 1) + ':' + (tab.position.column + 1);
+  const scrollbar = viewport?.scrollbar;
   return h(Box, {ref: panelRef, width, flexDirection: 'column', borderStyle: 'single',
     borderColor: focused ? palette.focusBorder : palette.border},
     h(PaneHeading, {label: 'SOURCE', detail, focused}),
-    ...visible,
-    ...Array.from({length: Math.max(0, rows - visible.length)}, (_, index) => h(Text, {key: 'blank-' + index}, ' ')));
+    h(Box, {height: rows, flexShrink: 0},
+      h(Box, {flexDirection: 'column', flexGrow: 1, flexShrink: 1, minWidth: 0},
+        ...visible,
+        ...Array.from({length: Math.max(0, rows - visible.length)}, (_, index) => h(Text, {key: 'blank-' + index}, ' '))),
+      scrollbar && h(Box, {width: 1, flexShrink: 0, flexDirection: 'column', 'aria-hidden': true},
+        ...Array.from({length: rows}, (_, row) => {
+          const thumb = row >= scrollbar.thumbTop && row < scrollbar.thumbTop + scrollbar.thumbHeight;
+          return h(Text, {key: row, color: thumb ? palette.focusBorder : palette.border}, thumb ? '▐' : '┊');
+        }))));
 }
 
 function HelpPanel({rows}) {
