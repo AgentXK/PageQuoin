@@ -1,4 +1,5 @@
 import CoreGraphics
+import Darwin
 import Foundation
 
 struct CompilationResult: Sendable {
@@ -6,8 +7,8 @@ struct CompilationResult: Sendable {
     let log: String
     let diagnostics: [BuildDiagnostic]
     let syncTeX: SyncTeXMap?
-    let artifactDirectory: URL?
-    let artifactWarning: String?
+    let exportedPDF: URL?
+    let pdfExportWarning: String?
 }
 
 enum TectonicError: LocalizedError {
@@ -45,6 +46,11 @@ enum TectonicError: LocalizedError {
 }
 
 struct TectonicCompiler {
+    static func siblingPDFURL(for target: URL) -> URL? {
+        guard target.isFileURL, ["tex", "ltx"].contains(target.pathExtension.lowercased()) else { return nil }
+        return target.deletingPathExtension().appendingPathExtension("pdf")
+    }
+
     static func buildArtifactDirectory(in projectRoot: URL) -> URL? {
         BuildArtifactStore.shared.existingDirectory(in: projectRoot)
     }
@@ -117,9 +123,9 @@ struct TectonicCompiler {
         guard let engine = engineURL ?? findEngine() else { throw TectonicError.engineNotFound }
         guard isExecutable(engine) else { throw TectonicError.invalidEngine(engine) }
 
-        let store = BuildArtifactStore.shared
-        let ticket = store.begin(projectRoot: projectRoot, target: fileURL)
-        defer { if let ticket { store.finish(ticket) } }
+        let export = fileURL.flatMap(siblingPDFURL(for:)).map { destination in
+            Result { try SiblingPDFExport(destination: destination) }
+        }
 
         let files = FileManager.default
         let directory = files.temporaryDirectory.appendingPathComponent("LocalTeX-\(UUID())", isDirectory: true)
@@ -158,7 +164,7 @@ struct TectonicCompiler {
 
         let engineLog = String(decoding: try Data(contentsOf: logURL), as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        var log = overlay?.originalPaths(in: engineLog, stagedAt: stagedProject) ?? engineLog
+        let log = overlay?.originalPaths(in: engineLog, stagedAt: stagedProject) ?? engineLog
         let transcript = readLog("texput.log", from: resultDirectory)
         let bibliographyLog = readLog("texput.blg", from: resultDirectory)
         var diagnostics = TectonicDiagnostics(target: fileURL, projectRoot: projectRoot).parse(
@@ -166,39 +172,12 @@ struct TectonicCompiler {
             bibliographyLog: bibliographyLog
         )
         let pdfURL = resultDirectory.appendingPathComponent("texput.pdf")
-        let pdf = process.terminationStatus == 0 ? try? Data(contentsOf: pdfURL) : nil
-        let artifactDirectory: URL?
-        var artifactWarning: String?
-        do {
-            artifactDirectory = try ticket.flatMap { try store.publish(resultDirectory, for: $0, commit: run.commit) }
-            artifactWarning = nil
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            artifactDirectory = nil
-            artifactWarning = "Could not save build files in the project. \(error.localizedDescription)"
-        }
-        if let ticket, let pdf, pdf.starts(with: "%PDF-".utf8),
-           let document = CGPDFDocument(pdfURL as CFURL), document.numberOfPages > 0 {
-            do {
-                try store.publishSharedPreview(pdfURL, artifactDirectory: artifactDirectory, for: ticket, commit: run.commit)
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                if artifactWarning == nil { artifactWarning = "Could not save the shared PDF. \(error.localizedDescription)" }
-            }
-        }
-        if let artifactWarning { diagnostics.append(BuildDiagnostic(severity: .warning, message: artifactWarning)) }
-        if let artifactDirectory {
-            log = log.replacingOccurrences(of: resultDirectory.resolvingSymlinksInPath().path, with: artifactDirectory.path)
-                .replacingOccurrences(of: resultDirectory.path, with: artifactDirectory.path)
-        }
-        let failureLog = [log, artifactWarning ?? ""].filter { !$0.isEmpty }.joined(separator: "\n\n")
         guard process.terminationStatus == 0 else {
-            throw TectonicError.failed(status: process.terminationStatus, log: failureLog, diagnostics: diagnostics)
+            throw TectonicError.failed(status: process.terminationStatus, log: log, diagnostics: diagnostics)
         }
-        guard let pdf, pdf.starts(with: "%PDF-".utf8) else {
-            throw TectonicError.missingPDF(log: failureLog, diagnostics: diagnostics)
+        guard let pdf = try? Data(contentsOf: pdfURL), pdf.starts(with: "%PDF-".utf8),
+              let document = CGPDFDocument(pdfURL as CFURL), document.numberOfPages > 0 else {
+            throw TectonicError.missingPDF(log: log, diagnostics: diagnostics)
         }
         let syncTeX = ["texput.synctex.gz", "texput.synctex"].lazy
             .compactMap { try? Data(contentsOf: resultDirectory.appendingPathComponent($0), options: .mappedIfSafe) }
@@ -207,8 +186,23 @@ struct TectonicCompiler {
                            stagedProjectRoot: overlay == nil ? nil : stagedProject,
                            originalProjectRoot: overlay?.root ?? projectRoot)
             }
+        var exportedPDF: URL?
+        var pdfExportWarning: String?
+        if let export {
+            do {
+                let destination = try export.get()
+                try destination.publish(pdf, run: run)
+                exportedPDF = destination.url
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                let warning = "Could not save the PDF beside the main document. \(error.localizedDescription)"
+                pdfExportWarning = warning
+                diagnostics.append(BuildDiagnostic(severity: .warning, message: warning))
+            }
+        }
         return CompilationResult(pdfData: pdf, log: log, diagnostics: diagnostics, syncTeX: syncTeX,
-                                 artifactDirectory: artifactDirectory, artifactWarning: artifactWarning)
+                                 exportedPDF: exportedPDF, pdfExportWarning: pdfExportWarning)
     }
 
     private static func readLog(_ name: String, from directory: URL) -> String {
@@ -217,6 +211,72 @@ struct TectonicCompiler {
         defer { try? reader.close() }
         let data = (try? reader.read(upToCount: 8 * 1024 * 1024)) ?? Data()
         return String(decoding: data, as: UTF8.self)
+    }
+}
+
+private final class SiblingPDFExport {
+    let url: URL
+    private let folder: URL
+    private let descriptor: Int32
+
+    init(destination: URL) throws {
+        url = destination
+        folder = destination.deletingLastPathComponent()
+        let descriptor = open(folder.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else { throw Self.posixError() }
+        self.descriptor = descriptor
+    }
+
+    deinit {
+        _ = close(descriptor)
+    }
+
+    func publish(_ pdf: Data, run: CompilationRun) throws {
+        try run.checkCancellation()
+        try requireOriginalFolder()
+        let staged = ".pagequoin-pdf-\(UUID())"
+        let output = openat(descriptor, staged, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, mode_t(0o666))
+        guard output >= 0 else { throw Self.posixError() }
+        defer { _ = unlinkat(descriptor, staged, 0) }
+        let handle = FileHandle(fileDescriptor: output, closeOnDealloc: true)
+        try handle.write(contentsOf: pdf)
+        try handle.close()
+
+        try run.commit {
+            try requireOriginalFolder()
+            let name = url.lastPathComponent
+            var destination = stat()
+            if fstatat(descriptor, name, &destination, AT_SYMLINK_NOFOLLOW) == 0 {
+                guard destination.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else {
+                    throw CocoaError(.fileWriteFileExists, userInfo: [
+                        NSLocalizedDescriptionKey: "The output path “\(name)” is occupied by a non-regular file."
+                    ])
+                }
+                guard renameat(descriptor, staged, descriptor, name) == 0 else { throw Self.posixError() }
+            } else {
+                guard errno == ENOENT else { throw Self.posixError() }
+                guard renameatx_np(descriptor, staged, descriptor, name, UInt32(RENAME_EXCL)) == 0 else {
+                    throw Self.posixError()
+                }
+            }
+        }
+    }
+
+    private func requireOriginalFolder() throws {
+        // The descriptor keeps operations in the original folder if its path moves.
+        var original = stat()
+        var current = stat()
+        guard fstat(descriptor, &original) == 0 else { throw Self.posixError() }
+        guard lstat(folder.path, &current) == 0,
+              original.st_dev == current.st_dev, original.st_ino == current.st_ino else {
+            throw CocoaError(.fileWriteUnknown, userInfo: [
+                NSLocalizedDescriptionKey: "The main document folder changed during compilation."
+            ])
+        }
+    }
+
+    private static func posixError() -> NSError {
+        NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
     }
 }
 

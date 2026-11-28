@@ -1,6 +1,6 @@
 {
   "name": "pagequoin-terminal",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "private": true,
   "description": "PageQuoin's cross-platform terminal LaTeX editor",
   "type": "module",

@@ -100,35 +100,48 @@ test('opens, detects and saves a large TeX source', async t => {
 
 test('only serves the selected PDF on a private loopback URL', async t => {
   const root = await project(t);
-  const file = await newDocument(root, 'test.pdf', '%PDF-1.5\nfixture\n');
+  const file = await newDocument(root, 'test 论文 #1.pdf', '%PDF-1.5\nfixture\n');
   const other = await newDocument(root, 'updated.pdf', '%PDF-1.5\nupdated\n');
   const preview = createPreview();
   t.after(() => preview.close());
   const url = await preview.url(file);
   assert.equal(new URL(url).hostname, '127.0.0.1');
+  assert.equal(decodeURIComponent(new URL(url).pathname.split('/').at(-1)), path.basename(file));
   const response = await fetch(url);
   assert.equal(response.headers.get('content-type'), 'application/pdf');
   assert.equal(await response.text(), '%PDF-1.5\nfixture\n');
   assert.equal((await fetch(new URL('/test.pdf', url))).status, 404);
+  assert.equal((await fetch(new URL('preview.pdf', url))).status, 404);
   assert.equal((await fetch(url, {method: 'POST'})).status, 404);
-  assert.equal(await preview.url(other), url);
-  assert.equal(await (await fetch(url)).text(), '%PDF-1.5\nupdated\n');
+  await fs.writeFile(file, '%PDF-1.5\nrebuilt\n');
+  assert.equal(await preview.url(file), url);
+  assert.equal(await (await fetch(url)).text(), '%PDF-1.5\nrebuilt\n');
+  const otherURL = await preview.url(other);
+  assert.notEqual(otherURL, url);
+  assert.equal((await fetch(url)).status, 404);
+  assert.equal(await (await fetch(otherURL)).text(), '%PDF-1.5\nupdated\n');
+  await fs.writeFile(other, 'Not a PDF');
+  assert.equal((await fetch(otherURL)).status, 404);
+  if (process.platform !== 'win32') {
+    await fs.unlink(other);
+    await fs.symlink(file, other);
+    assert.equal((await fetch(otherURL)).status, 404);
+  }
 });
 
-test('reads only valid previews from a desktop-owned project build directory', async t => {
+test('reads only a valid regular PDF beside the main file and ignores legacy previews', async t => {
   const root = await project(t);
   const main = await newDocument(root, 'main.tex', '');
   const folder = path.join(root, '.pagequoin-build');
   const previews = path.join(folder, 'previews');
   const key = createHash('sha256').update('main.tex').digest('hex').slice(0, 16);
-  const file = path.join(previews, key + '.pdf');
+  const oldPDF = path.join(previews, key + '.pdf');
+  const file = path.join(root, 'main.pdf');
   await fs.mkdir(previews, {recursive: true});
-  await fs.writeFile(file, '%PDF-1.5\nfixture');
-  assert.equal(await readSharedPDF(root, main), null);
-  await assert.rejects(compilePDF(root, main, {engine: 'engine-not-required'}), /does not own the folder/);
-  assert.deepEqual(await fs.readdir(folder), ['previews']);
-
+  await fs.writeFile(oldPDF, '%PDF-1.5\nlegacy fixture');
   await fs.writeFile(path.join(folder, '.pagequoin-owned'), 'PageQuoin Build Artifacts v1\n');
+  assert.equal(await readSharedPDF(root, main), null);
+  await fs.writeFile(file, '%PDF-1.5\nfixture');
   assert.equal(await readSharedPDF(root, main), file);
   await fs.writeFile(file, 'Not a PDF');
   assert.equal(await readSharedPDF(root, main), null);
@@ -216,10 +229,7 @@ test('Tectonic resolves a subfile and a failed rebuild preserves the last PDF', 
   assert.equal(await findMain(root, file), file);
   assert.equal(await readSharedPDF(root, file), null);
   const pdf = await compilePDF(root, file, {engine});
-  const cache = path.join(root, '.pagequoin-build');
-  const hash = createHash('sha256').update('paper with spaces/main.tex').digest('hex').slice(0, 16);
-  assert.equal(pdf, path.join(cache, 'previews', hash + '.pdf'));
-  assert.equal(await fs.readFile(path.join(cache, '.pagequoin-owned'), 'utf8'), 'PageQuoin Build Artifacts v1\n');
+  assert.equal(pdf, path.join(path.dirname(file), 'main.pdf'));
   assert.equal(await readSharedPDF(root, file), pdf);
   const content = await fs.readFile(pdf);
   assert.equal(content.subarray(0, 5).toString(), '%PDF-');
@@ -230,5 +240,6 @@ test('Tectonic resolves a subfile and a failed rebuild preserves the last PDF', 
   await assert.rejects(compilePDF(root, file, {engine}), /Tectonic failed/);
   assert.deepEqual(await fs.readFile(pdf), content);
   assert.equal(await readSharedPDF(root, file), pdf);
-  assert.deepEqual((await fs.readdir(cache)).sort(), ['.pagequoin-owned', 'previews']);
+  assert.deepEqual(await fs.readdir(root), ['paper with spaces']);
+  assert.deepEqual((await fs.readdir(path.dirname(file))).sort(), ['chapter.tex', 'main.pdf', 'main.tex']);
 });

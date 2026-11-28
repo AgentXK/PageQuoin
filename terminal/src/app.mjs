@@ -281,10 +281,8 @@ export function App({root, initial, mainFile, initialPDF, entries, session, auto
     const next = chosen ?? await findMain(root);
     await saveMainSelection(root, relative(chosen));
     const pdf = await readSharedPDF(root, next);
-    if (next !== model.main) {
-      model.pdf = pdf;
-      model.url = null;
-    } else if (pdf) model.pdf = pdf;
+    if (next !== model.main || !pdf) model.url = null;
+    model.pdf = pdf;
     model.main = next;
     status(chosen ? 'Main · ' + relative(chosen) : 'Main · Automatic' + (next ? ' · ' + relative(next) : ' · No main file found'));
   }
@@ -432,15 +430,6 @@ export function App({root, initial, mainFile, initialPDF, entries, session, auto
     else if (!model.tabs.length && unavailable && initial) await openFile(initial).catch(() => {});
     if (active()) await revealFile(active().file);
 
-    if (!model.pdf && (session.main === null || session.main === relative(model.main)) &&
-        session.pdf?.startsWith('.pagequoin-terminal/') && /\.pdf$/i.test(session.pdf)) {
-      try {
-        const pdf = await projectPath(root, session.pdf);
-        if (relative(pdf) === session.pdf && (await stat(pdf)).isFile()) model.pdf = pdf;
-      } catch {
-        // The project can still be edited if the old build was cleaned.
-      }
-    }
     const message = unavailable ? 'Restored project · Some tabs are unavailable' : 'Restored project';
     status(model.pdf ? message + ' · Ctrl+P to open the last PDF' : message);
   }
@@ -596,12 +585,9 @@ export function App({root, initial, mainFile, initialPDF, entries, session, auto
   }
 
   async function showPDF() {
-    model.pdf = await readSharedPDF(root, model.main) ?? model.pdf;
-    if (model.pdf && !(await stat(model.pdf).catch(() => null))?.isFile()) {
-      model.pdf = null;
-      model.url = null;
-    }
+    model.pdf = await readSharedPDF(root, model.main);
     if (!model.pdf) {
+      model.url = null;
       status('Compile a project first with Ctrl+R.', 'warning');
       return;
     }
@@ -628,25 +614,18 @@ export function App({root, initial, mainFile, initialPDF, entries, session, auto
       model.build = controller;
       model.log = '';
       model.logTop = 0;
-      let exported;
       status('Compiling ' + path.relative(model.root, main) + '…', 'accent');
       void compilePDF(model.root, main, {
         signal: controller.signal,
-        onExport(result) { exported = result; },
         onOutput(chunk) {
           model.log = (model.log + chunk).slice(-logLimit);
           model.logTop = scrollOffset(Infinity, model.log.split('\n').length, logFrame.rows);
           refresh();
         },
-      }).then(async pdf => {
+      }).then(pdf => {
         if (model.quitting) return;
         model.pdf = pdf;
-        model.url = await model.preview.url(pdf);
-        if (exported?.error) {
-          status('Preview ready · Could not write ' + relative(exported.file) + ' · ' + exported.error.message, 'warning');
-        } else {
-          status(exported ? 'Build complete · ' + relative(exported.file) : 'Build complete · Open PDF or Ctrl+P', 'success');
-        }
+        status('Build complete · ' + relative(pdf), 'success');
       }).catch(error => {
         if (!controller.signal.aborted) {
           model.logVisible = true;

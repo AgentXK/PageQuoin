@@ -2,21 +2,21 @@
 
 PageQuoin 是一个自用极简 LaTeX 编辑器，完全由 GPT 生成。
 
-提供 macOS 桌面版，以及支持 Windows、Linux 和 macOS 的终端版。两版均使用 Tectonic 编译。 [桌面版 v1.2.0](https://github.com/AgentXK/PageQuoin/releases/download/v1.2.0/PageQuoin-1.2.0-macOS-universal.zip) · [终端版 v1.3.0](https://github.com/AgentXK/PageQuoin/releases/download/terminal-v1.3.0/pagequoin-terminal-1.3.0.tgz) · [Tectonic 安装文档](https://tectonic-typesetting.github.io/book/latest/installation/)
+提供 macOS 桌面版，以及支持 Windows、Linux 和 macOS 的终端版。两版均使用 Tectonic 编译。 [桌面版 v1.3.0](https://github.com/AgentXK/PageQuoin/releases/download/desktop-v1.3.0/PageQuoin-1.3.0-macOS-universal.zip) · [终端版 v1.4.0](https://github.com/AgentXK/PageQuoin/releases/download/terminal-v1.4.0/pagequoin-terminal-1.4.0.tgz) · [Tectonic 安装文档](https://tectonic-typesetting.github.io/book/latest/installation/)
 
 ## macOS 桌面版
 
 需要 macOS 13 或更新版本。下载 macOS 通用 ZIP（支持 Apple Silicon 和 Intel），解压后将 `PageQuoin.app` 拖入「应用程序」。安装 Tectonic 可运行 `brew install tectonic`，也可在应用里通过 **Build → Choose Tectonic…** 选择已安装的编译器。
 
 - 用 **File → Open Project Folder…** 打开项目。文件树随磁盘变化刷新，大纲可跳转到章节。
-- 编辑区支持标签、自动保存和 LaTeX 补全。按 `⌘R` 编译，在右侧查看 PDF，双击预览可跳到源码。
-- 用 **Build → Clean Build Files** 清理当前项目的编译缓存。
+- 编辑区支持标签、自动保存和 LaTeX 补全。按 `⌘R` 编译，在主 `.tex` 旁生成同名 PDF，并在右侧预览。双击预览可跳到源码。
+- 用 **Build → Clean Build Files** 清理旧版本留下的编译缓存。
 
 发行包使用 ad hoc 签名，尚未经过 Apple 公证。 [首次打开应用的说明](https://support.apple.com/en-us/102445)
 
 ## 终端版
 
-安装 Node.js 22 或更新版本（含 npm）和 Tectonic。以下命令使用终端版 v1.3.0 的安装包。 [Node.js 下载](https://nodejs.org/en/download/)
+安装 Node.js 22 或更新版本（含 npm）和 Tectonic。以下命令使用终端版 v1.4.0 的安装包。 [Node.js 下载](https://nodejs.org/en/download/)
 
 ### Windows 安装
 
@@ -25,7 +25,7 @@ PageQuoin 是一个自用极简 LaTeX 编辑器，完全由 GPT 生成。
 ```powershell
 $env:TECTONIC_PATH = "$env:LOCALAPPDATA\Tectonic\tectonic.exe"
 & $env:TECTONIC_PATH --version
-npm.cmd install -g "$env:USERPROFILE\Downloads\pagequoin-terminal-1.3.0.tgz"
+npm.cmd install -g "$env:USERPROFILE\Downloads\pagequoin-terminal-1.4.0.tgz"
 Set-Location 'C:\Documents\paper'
 pq.cmd
 ```
@@ -37,7 +37,7 @@ pq.cmd
 在下载目录安装终端版 `.tgz`，再切换到项目目录运行 `pq`。
 
 ```sh
-npm install -g ./pagequoin-terminal-1.3.0.tgz
+npm install -g ./pagequoin-terminal-1.4.0.tgz
 cd /path/to/project
 pq
 ```
@@ -47,9 +47,9 @@ pq
 - 用 `pq resume`（Windows 用 `pq.cmd resume`）打开最近项目。选中项目后按 `Delete` 可移除恢复记录，项目文件会保留。
 - 工作区支持鼠标、自动保存、文件树、大纲、LaTeX 补全和括号引号配对。长文件可用滚轮或编辑区右侧滚动条浏览。按 `Ctrl+U` 查看快捷键。
 - `Ctrl+/` 切换 LaTeX 行注释，`Ctrl+X` 剪切选区或当前行，`Ctrl+A` 全选。`Alt+G` 跳到行号，`Ctrl+Home` 和 `Ctrl+End` 跳到文档首尾。
-- 点击 **Build**（`Ctrl+R`）在主文件旁生成同名 PDF。**Open PDF**（`Ctrl+P`）在浏览器打开预览，**Clean** 清理编译中间文件。
+- 点击 **Build**（`Ctrl+R`）在主文件旁生成同名 PDF。**Open PDF**（`Ctrl+P`）在浏览器打开这份 PDF。**Clean** 可清理旧版本留下的编译中间文件。
 
-在同一台 Mac 的同一账号下，两版共享主文档设置、最近项目、打开的源码标签和光标位置，以及最近成功的 PDF 预览。
+两版都预览主文件旁的同名 PDF。编译中间文件放在系统临时目录，由应用在编译结束后清理。在同一台 Mac 的同一账号下，两版还共享主文档设置、最近项目、打开的源码标签和光标位置。
 
 ## 从源码运行
 

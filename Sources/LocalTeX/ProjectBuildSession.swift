@@ -36,7 +36,8 @@ final class ProjectBuildSession {
     private(set) var phase = Phase.ready
     private(set) var preview: Preview?
     private(set) var log = "No build log yet."
-    private(set) var artifactWarning: String?
+    private(set) var exportedPDF: URL?
+    private(set) var pdfExportWarning: String?
     private(set) var diagnostics: [BuildDiagnostic] = []
     private(set) var automatic = false
     var isBuilding: Bool { phase == .building || phase == .stopping }
@@ -192,8 +193,8 @@ final class ProjectBuildSession {
     }
 
     func refreshSharedPreview() {
-        guard !isBuilding, let root, let target,
-              let saved = BuildArtifactStore.shared.sharedPreview(in: root, target: target),
+        guard !isBuilding, let target,
+              let saved = BuildArtifactStore.shared.sharedPreview(target: target),
               saved != sharedPreviewVersion,
               let data = try? Data(contentsOf: saved.url, options: .mappedIfSafe),
               data.starts(with: "%PDF-".utf8) else { return }
@@ -281,7 +282,8 @@ final class ProjectBuildSession {
         let startRevision = revision
         phase = .building
         diagnostics = []
-        artifactWarning = nil
+        exportedPDF = nil
+        pdfExportWarning = nil
         log = "Running Tectonic…"
         compileTask = Task { [weak self] in
             do {
@@ -318,7 +320,7 @@ final class ProjectBuildSession {
     }
 
     private func finish(_ result: CompilationResult, revision builtRevision: Int) {
-        artifactWarning = result.artifactWarning
+        pdfExportWarning = result.pdfExportWarning
         diagnostics = result.diagnostics
         guard let document = PDFDocument(data: result.pdfData), document.pageCount > 0 else {
             phase = .failed
@@ -328,8 +330,10 @@ final class ProjectBuildSession {
             return
         }
         preview = Preview(data: result.pdfData, document: document, syncTeX: result.syncTeX)
+        exportedPDF = result.exportedPDF
         log = result.log.isEmpty ? "Build succeeded." : result.log
-        if let warning = artifactWarning { log += "\n\n\(warning)" }
+        if let exportedPDF { log += "\n\nSaved PDF to \(exportedPDF.path)." }
+        if let pdfExportWarning { log += "\n\n\(pdfExportWarning)" }
         phase = builtRevision == revision ? .complete : .outdated
         finishBuild()
     }

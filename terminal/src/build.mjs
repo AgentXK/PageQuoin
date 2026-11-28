@@ -1,15 +1,15 @@
 import {spawn} from 'node:child_process';
-import {randomBytes, createHash} from 'node:crypto';
+import {randomBytes, randomUUID} from 'node:crypto';
+import {constants} from 'node:fs';
 import * as fs from 'node:fs/promises';
 import {createServer} from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
 import {pipeline} from 'node:stream/promises';
-import {setTimeout as pause} from 'node:timers/promises';
 import {isTeX, projectPath} from './files.mjs';
 
 export const logLimit = 64 * 1024;
 const buildFolder = '.pagequoin-build';
-const previewsFolder = 'previews';
 const markerFile = '.pagequoin-owned';
 const marker = Buffer.from('PageQuoin Build Artifacts v1\n');
 const desktopTargetName = /^[\p{L}\p{M}\p{N}_-]*-[0-9a-f]{16}$/u;
@@ -24,22 +24,6 @@ async function lstatIfPresent(file) {
   }
 }
 
-async function requireDirectory(directory) {
-  if (!(await fs.lstat(directory)).isDirectory()) {
-    throw new Error('Build output needs a regular directory inside the project.');
-  }
-}
-
-async function createDirectory(directory) {
-  try {
-    await fs.mkdir(directory, {mode: 0o700});
-    return true;
-  } catch (error) {
-    if (error.code !== 'EEXIST') throw error;
-    return false;
-  }
-}
-
 async function ownsBuildDirectory(directory) {
   if (!(await lstatIfPresent(directory))?.isDirectory()) return false;
   const file = path.join(directory, markerFile);
@@ -49,24 +33,6 @@ async function ownsBuildDirectory(directory) {
 
 function unmanagedBuildDirectory(directory) {
   return new Error('PageQuoin does not own the folder “' + directory + '”.');
-}
-
-async function prepareBuildDirectory(root) {
-  const directory = path.join(root, buildFolder);
-  if (await createDirectory(directory)) {
-    try {
-      await fs.writeFile(path.join(directory, markerFile), marker, {flag: 'wx', mode: 0o600});
-    } catch (error) {
-      await fs.rmdir(directory).catch(() => {});
-      throw error;
-    }
-  }
-  // Another app instance may be between creating the root and writing its marker.
-  for (let attempt = 0; attempt < 4; attempt++) {
-    if (await ownsBuildDirectory(directory)) return directory;
-    if (attempt < 3) await pause(25);
-  }
-  throw unmanagedBuildDirectory(directory);
 }
 
 async function entriesIfPresent(directory) {
@@ -143,36 +109,49 @@ export async function cleanBuildIntermediates(root) {
   return removed;
 }
 
-function pdfName(root, source) {
-  const relative = path.relative(root, source).split(path.sep).join('/');
-  return createHash('sha256').update(relative).digest('hex').slice(0, 16) + '.pdf';
+function siblingPDF(source) {
+  const {dir, name} = path.parse(source);
+  return path.join(dir, name + '.pdf');
+}
+
+async function openPDF(file) {
+  const expected = await lstatIfPresent(file);
+  if (!expected?.isFile()) return null;
+  const flags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
+  const handle = await fs.open(file, flags);
+  let valid = false;
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) return null;
+    if (!constants.O_NOFOLLOW) {
+      const current = await lstatIfPresent(file);
+      if (!current?.isFile() || current.dev !== info.dev || current.ino !== info.ino) return null;
+    }
+    const header = Buffer.alloc(pdfHeader.length);
+    const {bytesRead} = await handle.read(header, 0, header.length, 0);
+    valid = bytesRead === header.length && header.equals(pdfHeader);
+    return valid ? {handle, size: info.size} : null;
+  } finally {
+    if (!valid) await handle.close();
+  }
 }
 
 async function hasPDFHeader(file) {
-  if (!(await lstatIfPresent(file))?.isFile()) return false;
-  const handle = await fs.open(file, 'r');
-  try {
-    const header = Buffer.alloc(pdfHeader.length);
-    const {bytesRead} = await handle.read(header, 0, header.length, 0);
-    return bytesRead === header.length && header.equals(pdfHeader);
-  } finally {
-    await handle.close();
-  }
+  const pdf = await openPDF(file);
+  if (!pdf) return false;
+  await pdf.handle.close();
+  return true;
 }
 
 export async function readSharedPDF(root, main) {
   if (!main) return null;
   try {
     const source = await projectPath(root, main);
-    const storage = path.join(root, buildFolder);
-    if (!(await ownsBuildDirectory(storage))) return null;
-    const previews = path.join(storage, previewsFolder);
-    if (!(await lstatIfPresent(previews))?.isDirectory()) return null;
-    const pdf = path.join(previews, pdfName(root, source));
-    if (!(await hasPDFHeader(pdf))) return null;
-    return await projectPath(root, pdf);
+    if (!isTeX(source) || !(await lstatIfPresent(source))?.isFile()) return null;
+    const pdf = siblingPDF(source);
+    return await hasPDFHeader(pdf) ? pdf : null;
   } catch {
-    // An absent or invalid build cache is equivalent to no previous PDF.
+    // The project has no readable output for its main document.
     return null;
   }
 }
@@ -208,90 +187,81 @@ async function requireExportDestination(root, file, sourceDirectoryInfo) {
 }
 
 export async function compilePDF(root, main, {
-  engine = process.env.TECTONIC_PATH?.trim() || 'tectonic', signal, onOutput = () => {}, onExport,
+  engine = process.env.TECTONIC_PATH?.trim() || 'tectonic', signal, onOutput = () => {},
 } = {}) {
   if (signal?.aborted) throw new Error('Build stopped.');
   const source = await projectPath(root, main);
+  if (!isTeX(source) || !(await lstatIfPresent(source))?.isFile()) {
+    throw new Error('Choose a regular .tex or .ltx main document.');
+  }
   const sourceDirectory = path.dirname(source);
   const sourceDirectoryInfo = await fs.lstat(sourceDirectory);
-  const storage = await prepareBuildDirectory(root);
-  const previews = path.join(storage, previewsFolder);
-  await createDirectory(previews);
-  await requireDirectory(previews);
-  const staging = await fs.mkdtemp(path.join(storage, '.terminal-run-'));
-  const basename = path.parse(source).name;
-  const published = path.join(previews, pdfName(root, source));
-  const exported = path.join(sourceDirectory, basename + '.pdf');
-  let exportStaging;
+  const exported = siblingPDF(source);
+  const staging = await fs.mkdtemp(path.join(os.tmpdir(), 'pagequoin-tectonic-'));
+  let stagedPDF;
   try {
     if (signal?.aborted) throw new Error('Build stopped.');
     await runEngine(engine, ['--untrusted', '--color', 'never', '--outdir', staging, source],
       sourceDirectory, signal, onOutput);
-    const generated = path.join(staging, basename + '.pdf');
+    const generated = path.join(staging, path.basename(exported));
     if (!(await hasPDFHeader(generated))) throw new Error('Tectonic did not produce a PDF.');
     if (signal?.aborted) throw new Error('Build stopped.');
 
-    let exportError = null;
-    try {
-      if (!isTeX(source)) throw new Error('Choose a .tex or .ltx main document to save a PDF beside it.');
-      await requireExportDestination(root, exported, sourceDirectoryInfo);
-      exportStaging = await fs.mkdtemp(path.join(sourceDirectory, '.pagequoin-pdf-'));
-      await fs.copyFile(generated, path.join(exportStaging, 'output.pdf'));
-    } catch (error) {
-      exportError = error;
-    }
-
-    if (!(await ownsBuildDirectory(storage))) throw new Error('The build directory was removed or changed.');
-    await requireDirectory(previews);
-    const previous = await lstatIfPresent(published);
-    if (previous && !previous.isFile()) throw new Error('Build output cannot replace a non-regular file.');
+    await requireExportDestination(root, exported, sourceDirectoryInfo);
     if (signal?.aborted) throw new Error('Build stopped.');
-    await fs.rename(generated, published);
-
-    if (!exportError) {
-      try {
-        await requireExportDestination(root, exported, sourceDirectoryInfo);
-        if (signal?.aborted) throw new Error('Build stopped before saving the project PDF.');
-        await fs.rename(path.join(exportStaging, 'output.pdf'), exported);
-      } catch (error) {
-        exportError = error;
-      }
+    try {
+      await fs.rename(generated, exported);
+      return exported;
+    } catch (error) {
+      if (error.code !== 'EXDEV') throw error;
     }
-    onExport?.({file: exported, error: exportError});
-    return published;
+
+    // On a different volume, stage the finished PDF beside its destination for atomic replacement.
+    const temporaryPDF = path.join(sourceDirectory, '.pagequoin-pdf-' + randomUUID());
+    await fs.copyFile(generated, temporaryPDF, constants.COPYFILE_EXCL);
+    stagedPDF = temporaryPDF;
+    await requireExportDestination(root, exported, sourceDirectoryInfo);
+    if (signal?.aborted) throw new Error('Build stopped.');
+    await fs.rename(stagedPDF, exported);
+    stagedPDF = undefined;
+    return exported;
   } finally {
-    if (exportStaging && await sameDirectory(sourceDirectory, sourceDirectoryInfo).catch(() => false)) {
-      await fs.rm(exportStaging, {recursive: true, force: true}).catch(() => {});
+    if (stagedPDF && await sameDirectory(sourceDirectory, sourceDirectoryInfo).catch(() => false)) {
+      await fs.unlink(stagedPDF).catch(() => {});
     }
     await fs.rm(staging, {recursive: true, force: true}).catch(() => {});
   }
 }
 
 export function createPreview() {
-  const endpoint = '/' + randomBytes(24).toString('hex') + '/preview.pdf';
-  let file;
+  let selected;
   let listening;
   const host = '127.0.0.1';
   const server = createServer(async (request, response) => {
-    if (request.url !== endpoint || !file || !['GET', 'HEAD'].includes(request.method) ||
+    const preview = selected;
+    if (!preview || request.url !== preview.endpoint || !['GET', 'HEAD'].includes(request.method) ||
         request.headers.host !== host + ':' + server.address()?.port) {
       response.writeHead(404).end();
       return;
     }
     let handle;
     try {
-      handle = await fs.open(file, 'r');
-      const info = await handle.stat();
+      const pdf = await openPDF(preview.file);
+      if (!pdf) {
+        response.writeHead(404).end();
+        return;
+      }
+      handle = pdf.handle;
       response.writeHead(200, {
         'Content-Type': 'application/pdf',
-        'Content-Disposition': 'inline',
-        'Content-Length': info.size,
+        'Content-Disposition': "inline; filename*=UTF-8''" + preview.name,
+        'Content-Length': pdf.size,
         'Cache-Control': 'no-store',
         'X-Content-Type-Options': 'nosniff',
         'Cross-Origin-Resource-Policy': 'same-origin',
       });
       if (request.method === 'HEAD') response.end();
-      else await pipeline(handle.createReadStream(), response);
+      else await pipeline(handle.createReadStream({start: 0}), response);
     } catch {
       if (!response.headersSent) response.writeHead(404).end();
       else response.destroy();
@@ -302,7 +272,12 @@ export function createPreview() {
 
   return {
     async url(pdf) {
-      file = pdf;
+      if (selected?.file !== pdf) {
+        const name = encodeURIComponent(path.basename(pdf)).replace(/[!'()*]/g,
+          character => '%' + character.charCodeAt(0).toString(16).toUpperCase());
+        selected = {file: pdf, name, endpoint: '/' + randomBytes(24).toString('hex') + '/' + name};
+      }
+      const {endpoint} = selected;
       listening ??= new Promise((resolve, reject) => {
         const onError = error => {
           listening = undefined;

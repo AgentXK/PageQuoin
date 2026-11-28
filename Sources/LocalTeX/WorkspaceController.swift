@@ -84,7 +84,7 @@ final class WorkspaceController: NSViewController {
     var canStopCompilation: Bool { buildSession?.phase == .building }
     var canShowSourceInPDF: Bool { sourcePreviewLocation() != nil }
     var canCleanBuildFiles: Bool {
-        !isCleaningBuildFiles && (buildFilesDirectory != nil || (projectDirectory != nil && buildSession?.isBuilding == true))
+        !isCleaningBuildFiles && buildFilesDirectory != nil
     }
     var buildFilesDirectory: URL? {
         projectDirectory.flatMap(TectonicCompiler.buildArtifactDirectory(in:))
@@ -1138,7 +1138,12 @@ final class WorkspaceController: NSViewController {
         case .stopped:
             (message, symbol, color) = ("Compilation stopped", "stop.circle", AppPalette.secondaryText)
         case .complete:
-            (message, symbol, color) = ("Build complete", "checkmark.circle.fill", AppPalette.success)
+            message = session.exportedPDF.map { "Saved \($0.lastPathComponent)" } ?? "Build complete"
+            if session.pdfExportWarning == nil {
+                (symbol, color) = ("checkmark.circle.fill", AppPalette.success)
+            } else {
+                (symbol, color) = ("exclamationmark.circle.fill", AppPalette.warning)
+            }
         case .outdated:
             (message, symbol, color) = ("Source changed · Press ⌘R to update the preview", "circle.dotted", AppPalette.warning)
         case .failed:
@@ -1150,9 +1155,9 @@ final class WorkspaceController: NSViewController {
         statusLabel.stringValue = [externalFileNotice, message, problemCount > 0 ? problems : nil, session.target?.lastPathComponent,
                                    session.automatic ? "Auto-compile" : nil,
                                    autosaveWarning == nil ? nil : "Autosave failed",
-                                   session.artifactWarning == nil ? nil : "Build files not saved"]
+                                   session.pdfExportWarning == nil ? nil : "PDF not saved"]
             .compactMap { $0 }.joined(separator: " · ")
-        let warnings = [externalFileNotice, autosaveWarning, session.artifactWarning].compactMap { $0 }
+        let warnings = [externalFileNotice, autosaveWarning, session.pdfExportWarning].compactMap { $0 }
         statusLabel.toolTip = warnings.isEmpty ? nil : warnings.joined(separator: "\n")
         statusImage.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
         statusImage.contentTintColor = color
